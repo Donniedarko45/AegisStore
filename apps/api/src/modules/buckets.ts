@@ -21,6 +21,8 @@ interface BucketRow {
   owner_email: string;
   versioning_enabled: boolean;
   public_read: boolean;
+  protected_mode: boolean;
+  auto_lock: boolean;
   created_at: Date;
   object_count: number;
   total_bytes: number;
@@ -34,6 +36,8 @@ const toDto = (r: BucketRow, userId: string, isAdmin: boolean): BucketDto => ({
   ownerEmail: r.owner_email,
   versioningEnabled: r.versioning_enabled,
   publicRead: r.public_read,
+  protectedMode: r.protected_mode,
+  autoLock: r.auto_lock,
   createdAt: iso(r.created_at)!,
   objectCount: r.object_count,
   totalBytes: Number(r.total_bytes),
@@ -46,7 +50,7 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
     const isAdmin = user.role === 'ADMIN';
     const q = (req.query.q ?? '').trim().toLowerCase();
     const res = await ctx.db.execute(sql`
-      SELECT b.id, b.name, b.owner_id, u.email AS owner_email, b.versioning_enabled, b.public_read, b.created_at,
+      SELECT b.id, b.name, b.owner_id, u.email AS owner_email, b.versioning_enabled, b.public_read, b.protected_mode, b.auto_lock, b.created_at,
              coalesce(s.cnt, 0)::int AS object_count, coalesce(s.bytes, 0)::bigint AS total_bytes,
              g.permission AS grant_permission
       FROM buckets b
@@ -88,6 +92,8 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
           ownerEmail: user.email,
           versioningEnabled: b!.versioningEnabled,
           publicRead: b!.publicRead,
+          protectedMode: b!.protectedMode,
+          autoLock: b!.autoLock,
           createdAt: iso(b!.createdAt)!,
           objectCount: 0,
           totalBytes: 0,
@@ -117,6 +123,8 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
         ownerEmail: owner?.email,
         versioningEnabled: bucket.versioningEnabled,
         publicRead: bucket.publicRead,
+        protectedMode: bucket.protectedMode,
+        autoLock: bucket.autoLock,
         createdAt: iso(bucket.createdAt)!,
         objectCount: stats?.cnt ?? 0,
         totalBytes: Number(stats?.bytes ?? 0),
@@ -128,16 +136,33 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
   app.patch<{ Params: { bucket: string } }>('/api/buckets/:bucket', async (req) => {
     const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'ADMIN');
     const body = parse(updateBucketSchema, req.body);
+    // Lowering a defence must come from a person, not a script: a stolen API key must never be able
+    // to unlock the bucket it is attacking. While an attack alert is open, only a site admin can.
+    if (body.protectedMode === false || body.autoLock === false) {
+      const p = req.principal!;
+      if (p.kind !== 'USER') throw AppError.forbidden('Bucket protection can only be lowered from a signed-in session, not with an API key');
+      if (body.protectedMode === false && bucket.protectedMode && p.user.role !== 'ADMIN') {
+        const [open] = rowsOf<{ n: number }>(
+          await ctx.db.execute(sql`SELECT count(*)::int AS n FROM security_events WHERE bucket_id = ${bucket.id} AND status IN ('OPEN', 'ACKNOWLEDGED')`),
+        );
+        if ((open?.n ?? 0) > 0) throw AppError.forbidden('An open security alert exists for this bucket; an administrator must review it before unlocking');
+      }
+    }
     const [updated] = await ctx.db
       .update(buckets)
       .set({
         ...(body.versioningEnabled !== undefined && { versioningEnabled: body.versioningEnabled }),
         ...(body.publicRead !== undefined && { publicRead: body.publicRead }),
+        ...(body.protectedMode !== undefined && { protectedMode: body.protectedMode }),
+        ...(body.autoLock !== undefined && { autoLock: body.autoLock }),
       })
       .where(eq(buckets.id, bucket.id))
       .returning();
     await audit(ctx, req, { action: 'bucket.update', resourceType: 'bucket', resourceId: bucket.id, metadata: { name: bucket.name, changes: body } });
-    return { ok: true, versioningEnabled: updated!.versioningEnabled, publicRead: updated!.publicRead };
+    if (body.protectedMode !== undefined && body.protectedMode !== bucket.protectedMode) {
+      await audit(ctx, req, { action: body.protectedMode ? 'bucket.lock' : 'bucket.unlock', resourceType: 'bucket', resourceId: bucket.id, metadata: { name: bucket.name } });
+    }
+    return { ok: true, versioningEnabled: updated!.versioningEnabled, publicRead: updated!.publicRead, protectedMode: updated!.protectedMode, autoLock: updated!.autoLock };
   });
 
   app.delete<{ Params: { bucket: string } }>('/api/buckets/:bucket', async (req) => {

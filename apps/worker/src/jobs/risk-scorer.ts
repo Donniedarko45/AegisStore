@@ -91,8 +91,9 @@ export async function scoreNodes(ctx: WorkerCtx, cfg: { offlineAfterMs: number; 
       heartbeatAgeSec: n.heartbeat_age_sec ?? 0,
       heartbeatIntervalSec: cfg.heartbeatIntervalMs / 1000,
       offlineAfterSec: cfg.offlineAfterMs / 1000,
-      // an outage usually *is* a restart: count incidents once, not twice
-      flapsLastHour: Math.max(outages.find((o) => o.id === n.id)?.n ?? 0, restarts),
+      // an outage usually *is* a restart: count it once. A clean restart without an outage (a deploy)
+      // weighs half as much as a crash.
+      flapsLastHour: (outages.find((o) => o.id === n.id)?.n ?? 0) + Math.max(0, restarts - (outages.find((o) => o.id === n.id)?.n ?? 0)) * 0.5,
       corruptRatio: rh && rh.total >= 20 ? rh.bad / rh.total : 0,
       integrityFailures24h: failures.find((f) => f.name === n.name)?.n ?? 0,
       cpuPct: state.cpu,

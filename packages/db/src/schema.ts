@@ -85,6 +85,8 @@ export const buckets = pgTable(
     publicRead: boolean('public_read').notNull().default(false),
     /** set by the anomaly engine (Phase 10) */
     protectedMode: boolean('protected_mode').notNull().default(false),
+    /** opt-in: lock the bucket (protected mode) automatically when a HIGH+ attack is detected */
+    autoLock: boolean('auto_lock').notNull().default(false),
     defaultReplicas: integer('default_replicas').notNull().default(2),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
     createdAt: createdAt(),
@@ -141,6 +143,8 @@ export const objectVersions = pgTable(
     state: text('state').$type<VersionState>().notNull().default('PENDING'),
     storageClass: text('storage_class').$type<StorageClass>().notNull().default('WARM'),
     targetReplicas: integer('target_replicas').notNull().default(2),
+    /** Shannon entropy (bits/byte) of the first 64 KB: ~8 means random or encrypted */
+    entropy: real('entropy'),
     isProtected: boolean('is_protected').notNull().default(false),
     protectedUntil: timestamp('protected_until', { withTimezone: true }),
     createdBy: uuid('created_by').references(() => users.id),
@@ -229,6 +233,39 @@ export const nodeMetrics = pgTable(
     uptimeSec: real('uptime_sec').notNull().default(0),
   },
   (t) => [index('node_metrics_node_ts_idx').on(t.nodeId, t.ts)],
+);
+
+// ---------------------------------------------------------------- security (§9.5, §9.6)
+export const securityEvents = pgTable(
+  'security_events',
+  {
+    id: id(),
+    /** RANSOMWARE | MASS_DELETE | ANOMALY */
+    kind: text('kind').notNull(),
+    /** LOW | MEDIUM | HIGH | CRITICAL */
+    severity: text('severity').notNull(),
+    /** OPEN | ACKNOWLEDGED | RESOLVED | FALSE_POSITIVE */
+    status: text('status').notNull().default('OPEN'),
+    bucketId: uuid('bucket_id').references(() => buckets.id),
+    actorId: uuid('actor_id'),
+    actorLabel: text('actor_label'),
+    actorType: text('actor_type'),
+    /** [{ signal, value, threshold, severity, detail }] */
+    signals: jsonb('signals').$type<Record<string, unknown>[]>().notNull().default([]),
+    counts: jsonb('counts').$type<Record<string, number>>().notNull().default({}),
+    attackStart: timestamp('attack_start', { withTimezone: true }).notNull(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull(),
+    protectedVersions: integer('protected_versions').notNull().default(0),
+    /** the bucket was locked (protected mode) because of this event */
+    contained: boolean('contained').notNull().default(false),
+    notes: text('notes'),
+    recovery: jsonb('recovery').$type<Record<string, unknown>>(),
+    resolvedBy: uuid('resolved_by').references(() => users.id),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    createdAt: createdAt(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('security_events_status_idx').on(t.status, t.createdAt), index('security_events_bucket_actor_idx').on(t.bucketId, t.actorId)],
 );
 
 // ---------------------------------------------------------------- background jobs

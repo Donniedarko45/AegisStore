@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream';
-import { and, desc, eq, inArray, notInArray, objectVersions, objects, replicas, sql, storageNodes, users } from '@aegis/db';
+import { and, buckets, desc, eq, inArray, notInArray, objectVersions, objects, replicas, sql, storageNodes, users } from '@aegis/db';
 import {
   AppError,
   listObjectsQuerySchema,
@@ -40,6 +40,16 @@ function keyFrom(q: Q): string {
 }
 
 const sha256Of = (buf: Buffer) => createHash('sha256').update(buf).digest('hex');
+
+/** A locked bucket (protected mode, §9.5) refuses anything that destroys existing data. */
+function assertNotLocked(bucket: BucketRow, what: string) {
+  if (bucket.protectedMode) {
+    throw new AppError(423, 'BUCKET_PROTECTED', `This bucket is locked (protected mode) after suspicious activity: ${what} is blocked. An administrator can unlock it.`);
+  }
+}
+
+const isProtectedNow = (v: { isProtected: boolean; protectedUntil: Date | null }) =>
+  v.isProtected && (!v.protectedUntil || v.protectedUntil.getTime() > Date.now());
 
 async function findObject(ctx: AppContext, bucketId: string, key: string) {
   const [row] = await ctx.db
@@ -124,7 +134,8 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
         .from(objectVersions)
         .where(and(eq(objectVersions.id, req.query.versionId!), eq(objectVersions.objectId, obj.id)));
       if (!v || v.state !== 'ACTIVE') throw AppError.notFound('Version not found');
-      if (v.isProtected) throw AppError.conflict('This version is protected and cannot be deleted');
+      assertNotLocked(bucket, 'deleting versions');
+      if (isProtectedNow(v)) throw AppError.conflict('This version is protected (pre-attack copy) and cannot be deleted');
       await ctx.db.transaction(async (tx) => {
         await tx.update(objectVersions).set({ state: 'DELETED', deletedAt: new Date(), purgeAfter }).where(eq(objectVersions.id, v.id));
         if (obj.currentVersionId === v.id) {
@@ -142,6 +153,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
     }
 
     if (!obj.currentVersionId) throw AppError.notFound('Object not found');
+    assertNotLocked(bucket, 'deleting objects');
     await ctx.db.transaction(async (tx) => {
       const [locked] = await tx.select().from(objects).where(eq(objects.id, obj.id)).for('update');
       if (!locked?.currentVersionId) return;
@@ -458,7 +470,9 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
         state: v.state,
         isDeleteMarker: v.isDeleteMarker,
         isCurrent: v.id === obj.currentVersionId,
-        isProtected: v.isProtected,
+        isProtected: isProtectedNow(v),
+        protectedUntil: isProtectedNow(v) ? iso(v.protectedUntil) : null,
+        entropy: v.entropy,
         createdAt: iso(v.createdAt),
         deletedAt: iso(v.deletedAt),
         purgeAfter: iso(v.purgeAfter),
@@ -502,6 +516,10 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
   if (expectedSize !== undefined && expectedSize > ctx.cfg.MAX_UPLOAD_BYTES) {
     throw new AppError(413, 'PAYLOAD_TOO_LARGE', `Single uploads are limited to ${ctx.cfg.MAX_UPLOAD_BYTES} bytes`);
   }
+  if (bucket.protectedMode) {
+    const existing = await findObject(ctx, bucket.id, key);
+    if (existing?.currentVersionId) assertNotLocked(bucket, 'overwriting objects');
+  }
   const contentType = String(req.headers['content-type'] ?? 'application/octet-stream').slice(0, 255);
   const wanted = bucket.defaultReplicas;
   const versionId = randomUUID();
@@ -524,7 +542,7 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
 
   // 1. record intent (PENDING) so a crash leaves a cleanable trail, never a half-visible object
   const blobPath = `blobs/${blobId.slice(0, 2)}/${blobId}`;
-  const { objectId, versionNo } = await ctx.db.transaction(async (tx) => {
+  const { objectId, versionNo, prev, startedAt } = await ctx.db.transaction(async (tx) => {
     const [obj] = await tx
       .insert(objects)
       .values({ bucketId: bucket.id, key })
@@ -534,18 +552,27 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
       .select({ n: sql<number>`coalesce(max(${objectVersions.versionNo}), 0)::int` })
       .from(objectVersions)
       .where(eq(objectVersions.objectId, obj!.id));
-    await tx.insert(objectVersions).values({
-      id: versionId,
-      objectId: obj!.id,
-      versionNo: n + 1,
-      contentType,
-      blobId,
-      state: 'PENDING',
-      targetReplicas: wanted,
-      createdBy: principal.user.id,
-    });
+    const [created] = await tx
+      .insert(objectVersions)
+      .values({
+        id: versionId,
+        objectId: obj!.id,
+        versionNo: n + 1,
+        contentType,
+        blobId,
+        state: 'PENDING',
+        targetReplicas: wanted,
+        createdBy: principal.user.id,
+      })
+      .returning({ createdAt: objectVersions.createdAt });
     await tx.insert(replicas).values(nodes.map((node) => ({ versionId, nodeId: node.id, blobPath, state: 'PENDING' as const })));
-    return { objectId: obj!.id, versionNo: n + 1 };
+    // what this upload replaces (ransomware heuristics compare the old and new entropy)
+    const [prevRow] = await tx
+      .select({ entropy: objectVersions.entropy })
+      .from(objects)
+      .innerJoin(objectVersions, eq(objectVersions.id, objects.currentVersionId))
+      .where(eq(objects.id, obj!.id));
+    return { objectId: obj!.id, versionNo: n + 1, prev: prevRow ?? null, startedAt: created!.createdAt };
   });
 
   const discard = async () => {
@@ -650,16 +677,19 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     // took longer than the abandoned-upload timeout) we must not point the object at a ghost row.
     const activated = await tx
       .update(objectVersions)
-      .set({ state: 'ACTIVE', size: stats.size, sha256: stats.sha256 })
+      .set({ state: 'ACTIVE', size: stats.size, sha256: stats.sha256, entropy: stats.entropy })
       .where(and(eq(objectVersions.id, versionId), eq(objectVersions.state, 'PENDING')))
       .returning({ id: objectVersions.id });
     if (activated.length === 0) return false;
+    const [locked] = await tx.select().from(objects).where(eq(objects.id, objectId)).for('update');
+    // the bucket may have been locked by the anomaly detector while this upload was streaming
+    const [b] = await tx.select({ protectedMode: buckets.protectedMode }).from(buckets).where(eq(buckets.id, bucket.id));
+    if (b?.protectedMode && locked?.currentVersionId) return 'locked' as const;
     await tx
       .update(replicas)
       .set({ state: 'HEALTHY', sha256: stats.sha256, lastVerifiedAt: new Date() })
       .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, holderIds)));
     await tx.delete(replicas).where(and(eq(replicas.versionId, versionId), notInArray(replicas.nodeId, holderIds)));
-    const [locked] = await tx.select().from(objects).where(eq(objects.id, objectId)).for('update');
     if (locked?.currentVersionId && !bucket.versioningEnabled) {
       // overwrite without versioning: the old bytes stay recoverable until the retention purge
       await tx
@@ -670,8 +700,12 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     await tx.update(objects).set({ currentVersionId: versionId, updatedAt: new Date() }).where(eq(objects.id, objectId));
     return true;
   });
-  if (!finalized) {
+  if (finalized !== true) {
     await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
+    if (finalized === 'locked') {
+      await discard();
+      assertNotLocked({ ...bucket, protectedMode: true }, 'overwriting objects');
+    }
     throw new AppError(502, 'UPLOAD_FAILED', 'Upload took too long and was cleaned up as abandoned; please retry.');
   }
   const fallback = holders.filter((h) => h.fallbackFor).map((h) => ({ failed: h.fallbackFor, replacement: h.node.name }));
@@ -680,7 +714,20 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     action: 'object.upload',
     resourceType: 'object',
     resourceId: objectId,
-    metadata: { bucket: bucket.name, key, size: stats.size, sha256: stats.sha256, versionNo, nodes: holders.map((h) => h.node.name), ...(fallback.length && { fallback }) },
+    metadata: {
+      bucket: bucket.name,
+      key,
+      size: stats.size,
+      sha256: stats.sha256,
+      versionNo,
+      nodes: holders.map((h) => h.node.name),
+      overwrite: !!prev,
+      // when the version row was created (the audit entry is written when the upload finishes)
+      startedAt: startedAt.toISOString(),
+      entropy: stats.entropy,
+      ...(prev && { prevEntropy: prev.entropy }),
+      ...(fallback.length && { fallback }),
+    },
   });
   void publishEvent(ctx.redis, 'object.created', { bucket: bucket.name, key, size: stats.size });
 

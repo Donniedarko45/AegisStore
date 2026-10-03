@@ -7,7 +7,7 @@
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "echo 'worker is covered by the e2e script'"
+    "test": "vitest run"
   },
   "dependencies": {
     "@aegis/db": "workspace:*",

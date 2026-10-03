@@ -8,6 +8,7 @@ import { runGc } from './jobs/gc';
 import { sweepNodeHealth } from './jobs/health-sweeper';
 import { rollupMetrics } from './jobs/metrics-rollup';
 import { purgeExpired } from './jobs/retention-purge';
+import { detectAnomalies } from './jobs/anomaly';
 import { classifyObjects, pruneAccess } from './jobs/classifier';
 import { JobRunner, reconcile, scrub } from './jobs/healing';
 import { scoreNodes } from './jobs/risk-scorer';
@@ -91,6 +92,16 @@ if (leader) {
       hotDemoteHours: cfg.HOT_DEMOTE_HOURS,
       coldAfterDays: cfg.COLD_AFTER_DAYS,
       hotReplicas: cfg.HOT_REPLICAS,
+    }),
+  );
+  every('anomaly-detector', cfg.ANOMALY_INTERVAL_MS, () =>
+    detectAnomalies(ctx, {
+      deleteBurstPerMin: cfg.ANOMALY_DELETE_BURST,
+      deleteSharePct: cfg.ANOMALY_DELETE_SHARE_PCT,
+      overwriteBurstPerMin: cfg.ANOMALY_OVERWRITE_BURST,
+      entropyShifts: cfg.ANOMALY_ENTROPY_SHIFTS,
+      extensionChurn: cfg.ANOMALY_EXTENSION_CHURN,
+      protectDays: cfg.PROTECT_DAYS,
     }),
   );
   every('access-prune', cfg.GC_INTERVAL_MS, () => pruneAccess(ctx, Math.max(8, cfg.COLD_AFTER_DAYS + 1)));

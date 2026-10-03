@@ -232,8 +232,8 @@ check(`served by ${other}`, d.headers.get('x-aegis-served-by') === other, d.head
 r = await alice.get(`/api/buckets/${bucket}/objects?integrity=DEGRADED`);
 check('integrity filter finds the degraded object', r.data.items.some((i) => i.key === `fallback-${run}.txt`));
 r = await alice.get('/api/dashboard/summary');
-// HEALTHY or WARNING (a node that flapped recently is at risk but still serving)
-check('dashboard shows 1 node offline and 2 serving', r.data.nodes.byStatus.OFFLINE === 1 && r.data.nodes.byStatus.HEALTHY + r.data.nodes.byStatus.WARNING === 2, JSON.stringify(r.data.nodes));
+// the others may be HEALTHY, WARNING or HIGH_RISK (a node that flapped recently is at risk but still serving)
+check('dashboard shows 1 node offline and 2 online', r.data.nodes.byStatus.OFFLINE === 1 && r.data.nodes.total - r.data.nodes.byStatus.OFFLINE === 2, JSON.stringify(r.data.nodes));
 r = await upload(alice, bucket, `during-outage-${run}.txt`, Buffer.from('written while a node is down'));
 check('uploads still succeed with 2 healthy nodes', r.status === 201 && !r.data.replicas.some((x) => x.node === victim));
 

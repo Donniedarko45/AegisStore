@@ -17,7 +17,7 @@ const rows = <T>(r: unknown) => (r as { rows: T[] }).rows;
 
 /**
  * Physically remove data whose retention window has passed (DELETED + purge_after <= now, not
- * protected). Blobs can be shared by several versions (restore re-uses the blob), so a blob is only
+ * protected, or protected only until a time that has passed). Blobs can be shared by several versions (restore re-uses the blob), so a blob is only
  * deleted from the nodes when EVERY version referencing it is being purged. A node that cannot be
  * reached keeps its replica row and the version stays DELETED, so the next run retries; nothing is
  * marked PURGED while bytes may still exist on disk.
@@ -26,7 +26,8 @@ export async function purgeExpired(db: Db, storage: StorageClient, log: Logger, 
   const due = rows<DueVersion>(
     await db.execute(sql`
       SELECT id, blob_id FROM object_versions
-       WHERE state = 'DELETED' AND purge_after <= now() AND is_protected = false
+       WHERE state = 'DELETED' AND purge_after <= now()
+         AND (is_protected = false OR protected_until <= now())
        ORDER BY purge_after LIMIT ${batch}`),
   );
   if (due.length === 0) return { purged: 0, blobsDeleted: 0, pending: 0 };

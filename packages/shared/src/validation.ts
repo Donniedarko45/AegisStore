@@ -29,6 +29,10 @@ export const createBucketSchema = z.object({
 export const updateBucketSchema = z.object({
   versioningEnabled: z.boolean().optional(),
   publicRead: z.boolean().optional(),
+  /** locked: deletes and overwrites are refused (423) */
+  protectedMode: z.boolean().optional(),
+  /** lock automatically when a HIGH+ attack is detected */
+  autoLock: z.boolean().optional(),
 });
 
 export const setGrantSchema = z.object({

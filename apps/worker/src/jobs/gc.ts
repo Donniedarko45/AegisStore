@@ -41,6 +41,8 @@ export async function runGc(db: Db, storage: StorageClient, log: Logger, metrics
        AND o.updated_at < now() - interval '1 hour'
        AND NOT EXISTS (SELECT 1 FROM object_versions v WHERE v.object_id = o.id)`);
 
+  // versions protected after an attack become ordinary again when their protection window ends
+  await db.execute(sql`UPDATE object_versions SET is_protected = false WHERE is_protected AND protected_until <= now()`);
   await db.execute(sql`DELETE FROM sessions WHERE expires_at < now()`);
   await db.execute(sql`DELETE FROM node_metrics WHERE ts < now() - make_interval(days => ${metricsRetentionDays})`);
 }

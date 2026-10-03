@@ -32,6 +32,15 @@ const schema = z.object({
   HOT_DEMOTE_HOURS: envInt(48),
   COLD_AFTER_DAYS: envInt(14),
   HOT_REPLICAS: envInt(3),
+  /** ransomware / anomaly detection (§9.5) */
+  ANOMALY_INTERVAL_MS: envInt(10_000),
+  ANOMALY_DELETE_BURST: envInt(50),
+  ANOMALY_DELETE_SHARE_PCT: envInt(30),
+  ANOMALY_OVERWRITE_BURST: envInt(50),
+  ANOMALY_ENTROPY_SHIFTS: envInt(5),
+  ANOMALY_EXTENSION_CHURN: envInt(10),
+  /** pre-attack versions stay immutable (and unpurgeable) this long */
+  PROTECT_DAYS: envInt(30),
   LOG_LEVEL: z.string().default('info'),
 });
 export type Config = z.infer<typeof schema>;

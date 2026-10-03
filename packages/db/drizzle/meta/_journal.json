@@ -29,6 +29,13 @@
       "when": 1791025789603,
       "tag": "0003_access_classes",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791026094808,
+      "tag": "0004_security",
+      "breakpoints": true
     }
   ]
 }

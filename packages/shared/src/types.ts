@@ -38,6 +38,8 @@ export interface BucketDto {
   ownerEmail?: string;
   versioningEnabled: boolean;
   publicRead: boolean;
+  protectedMode: boolean;
+  autoLock: boolean;
   createdAt: string;
   objectCount?: number;
   totalBytes?: number;
