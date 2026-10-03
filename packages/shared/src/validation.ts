@@ -61,3 +61,21 @@ export function validateObjectKey(key: unknown): string {
     throw new Error('Object key must not contain "." or ".." path segments');
   return key;
 }
+
+const finite = z.number().finite();
+export const HeartbeatBodyGuard = z.object({
+  name: z.string().min(1).max(100),
+  baseUrl: z.string().url(),
+  metrics: z.object({
+    cpuPct: finite,
+    memPct: finite,
+    diskUsedBytes: finite.nonnegative(),
+    diskCapacityBytes: finite.positive(),
+    diskUsedPct: finite,
+    latencyMsP50: finite,
+    latencyMsP95: finite,
+    errorRate: finite,
+    blobCount: finite.int().nonnegative(),
+    uptimeSec: finite,
+  }),
+});

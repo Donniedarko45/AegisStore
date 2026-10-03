@@ -60,7 +60,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
 
   app.put<BlobParams & { Body: NodeJS.ReadableStream }>('/internal/blobs/:blobId/stage', async (req, reply) => {
     const blobId = BlobStore.assertBlobId(req.params.blobId);
-    const len = Number(req.headers['content-length']);
+    const len = Number(req.headers['x-expected-size'] ?? req.headers['content-length']);
     if (Number.isFinite(len) && !store.hasCapacityFor(len)) {
       return reply.code(507).send({ error: 'insufficient storage' });
     }
