@@ -1,6 +1,7 @@
 # AegisStore — System Architecture
 
-> Status: **DRAFT v0.1 for review** · Date: 2026-10-03
+> Status: **v0.2: Batch 1 (Phases 1–5) implemented** · Date: 2026-10-03
+> Where the implementation differs from this design, see **§17 As built**.
 > Source: *AegisStore — Current User Manual (Batch 1, Phases 1–5)*
 > Scope: the **whole** system — Batch 1 foundation **and** the intelligent features still to build.
 
@@ -407,7 +408,7 @@ sequenceDiagram
 
 Notes:
 - **The manual says "API computes SHA-256 first"**; we compute it *while streaming* (single pass, constant memory) and make the commit conditional on all node hashes matching — same guarantee, no temp file on the API.
-- Failure of one node mid-stream → abort everything, pick a replacement node, retry once (transparent to client) before failing.
+- Failure of one node mid-stream → abort everything and return `502 UPLOAD_FAILED`; the client retries. A streamed body cannot be replayed without buffering it, so there is no transparent server-side retry (see §17).
 - **Overwrite** with versioning **off**: new version replaces old; old version marked `DELETED` with `purge_after = now()+24h` (retention, §9.7) — gives a recovery window even without versioning. With versioning **on**: old versions stay `ACTIVE` (non-current).
 - Orphan sweep: `PENDING` versions older than 1 h → abort and clean staged blobs (Worker).
 
@@ -861,20 +862,20 @@ Erasure coding for COLD data; at-rest encryption + KMS; mTLS between services; d
 ## Appendix A — Core API surface (v1 draft)
 
 ```
-POST   /api/auth/register | /login | /logout | /refresh      GET /api/auth/me
+POST   /api/auth/register | /login | /logout                GET /api/auth/me
 GET|POST|DELETE /api/api-keys[/:id]
 
 GET|POST   /api/buckets                       GET|PATCH|DELETE /api/buckets/:b
 GET|PUT|DELETE /api/buckets/:b/grants[/:userId]
 
 GET    /api/buckets/:b/objects?prefix=&q=&class=&integrity=&sort=&page=
-PUT    /api/buckets/:b/objects/*key           (upload, streaming)
-GET    /api/buckets/:b/objects/*key[?versionId=]      (download)
-HEAD   /api/buckets/:b/objects/*key
-DELETE /api/buckets/:b/objects/*key[?versionId=]
-GET    /api/buckets/:b/objects/*key/details   (size, sha256, replicas, versions)
-POST   /api/buckets/:b/objects/*key/versions/:v/restore
-POST   /api/buckets/:b/objects/*key/share     → signed URL
+PUT    /api/buckets/:b/object?key=…                 (upload, streaming body)
+GET    /api/buckets/:b/object?key=…[&versionId=]    (download)
+HEAD   /api/buckets/:b/object?key=…
+DELETE /api/buckets/:b/object?key=…[&versionId=]
+GET    /api/buckets/:b/object/details?key=…         (size, sha256, replicas, versions)
+POST   /api/buckets/:b/object/restore?key=…&versionId=   (Phase 6)
+POST   /api/buckets/:b/object/share?key=…           → signed URL (Phase 11)
 GET    /s/:token                              (public, signed)
 
 POST|PUT|POST|DELETE /api/buckets/:b/multipart[...]   (see §6.7)
@@ -915,3 +916,36 @@ Notable codes: `401 UNAUTHENTICATED`, `403 FORBIDDEN`, `404 NOT_FOUND`, `409 CHE
 | HOT/WARM/COLD + adaptive replication | §9.3 / §9.4 |
 | Ransomware detection, protected recovery, security events | §9.5 / §9.6 |
 | Simulation Lab / Analytics / SSE / Retention | §9.8 / §9.9 / §11 / §9.7 |
+
+---
+
+## 17. As built (Batch 1): deviations and decisions
+
+Batch 1 (Phases 1–5) is implemented. `scripts/verify-e2e.mjs` runs 81 checks against the real `docker compose` stack. Where the code differs from the design above, the code wins and the reason is recorded here.
+
+| # | Design said | Implemented | Why |
+|---|---|---|---|
+| 1 | JWT access token + rotating refresh token (§10.1) | **Opaque server-side sessions**: a random 256-bit token in an `httpOnly; SameSite=Lax` cookie, with only its SHA-256 stored in `sessions` (7-day TTL) | Revocable instantly (logout, account disable), no key management, and no refresh flow to get wrong. |
+| 2 | CSRF via double-submit token | **Origin check** for cookie-authenticated `POST/PUT/PATCH/DELETE`, compared against the proxy-aware request host (`X-Forwarded-Host` from nginx / the Vite proxy) | Same protection with `SameSite=Lax` and no token plumbing in the SPA. Requests without `Origin` (curl, scripts) cannot carry the cookie cross-site. |
+| 3 | Object routes `…/objects/*key` | `…/object?key=` (singular) and `…/objects` for listing | Keys may contain `/` and words like `details`; a query parameter keeps routing unambiguous. |
+| 4 | Upload: retry once on a replacement node | All-or-nothing; `502` on any node failure or checksum mismatch, and the client retries | A streamed request body cannot be replayed without buffering it, which would break NFR-5 (constant memory). |
+| 5 | Latest node metrics in Redis | Stored in `storage_nodes.last_metrics` (Postgres), sampled every 30 s into `node_metrics` | Health decisions must survive a Redis loss (NFR-4). Redis is used for rate limiting and event pub/sub only, and the API runs fine with Redis down. |
+| 6 | `jobs`, `access_stats`, `security_events`, multipart tables | **Not created yet**; they arrive with the phases that use them (6–11) | No dead schema. Placeholder columns that are cheap now (`storage_class`, `target_replicas`, `is_protected`, `protected_mode`) are already present. |
+| 7 | Audit `row_hash` over the row | Hash over **canonical (sorted-key) JSON** | Postgres `jsonb` reorders object keys, so hashing insertion order made the chain fail verification. |
+| 8 | Node capacity check via `Content-Length` | The API streams with chunked encoding and sends `X-Expected-Size`; the node checks it before writing (`507` when full) | Fan-out writes are chunked. |
+| 9 | Bucket delete | **Soft delete** (`deleted_at`), and the name becomes reusable (partial unique index) | Deleted and overwritten versions keep their blobs until the retention purge (Phase 6), which still needs the bucket row. |
+| 10 | Separate Dockerfile per service | One `deploy/Dockerfile` with targets `api`, `worker`, `storage-node`, `web`; an optional `extra_ca` build secret for TLS-intercepting proxies | Shared, cached dependency layers. Services run TypeScript through `tsx` (no separate compile step). Bundling with esbuild is a Phase 13 hardening item. |
+| 11 | Grants UI planned for Phase 6 | **Done in Batch 1** (bucket → Settings → Shared access) | Small, and the API already existed. |
+| 12 | Login rate limit fixed | `REGISTER_RATE_LIMIT` / `LOGIN_RATE_LIMIT` env (defaults 10) | Tunable per deployment. |
+
+**Answers to the open questions in §16, as implemented:**
+
+1. TypeScript/Fastify/Drizzle/React.
+2. Hash while streaming.
+3. Jobs table in Postgres (Phase 8).
+4. Downloads ≤ 16 MB are verified before the first byte is sent, and larger ones are streamed and verified at the end (the transfer is aborted on a mismatch).
+5. Per-bucket `default_replicas` = `REPLICATION_FACTOR` (2).
+6. Anomaly defaults decided in Phase 10.
+7. 24 h retention.
+8. The default admin password is kept, with a warning at boot.
+9. httpOnly cookies.

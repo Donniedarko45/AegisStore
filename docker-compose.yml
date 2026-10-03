@@ -1,0 +1,148 @@
+# AegisStore — full stack:  cp .env.example .env && docker compose up --build
+# Dashboard: http://localhost:8080   (only port published to the host)
+
+name: aegisstore
+
+x-service: &service
+  restart: unless-stopped
+  networks: [aegis-net]
+
+x-node-env: &node-env
+  PORT: "4000"
+  DATA_DIR: /data
+  API_URL: http://api:3000
+  NODE_SHARED_SECRET: ${NODE_SHARED_SECRET:?set NODE_SHARED_SECRET in .env}
+  NODE_CAPACITY_BYTES: ${NODE_CAPACITY_BYTES:-10737418240}
+  HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-5000}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 5s
+
+services:
+  postgres:
+    <<: *service
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aegis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-aegis}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Redis holds nothing that cannot be rebuilt (rate limits, live events): no persistence on purpose.
+  redis:
+    <<: *service
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    <<: *service
+    build: { context: ., dockerfile: deploy/Dockerfile, target: api }
+    image: aegisstore/api:dev
+    environment:
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      NODE_SHARED_SECRET: ${NODE_SHARED_SECRET:?set NODE_SHARED_SECRET in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@aegis.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeMe123!}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      VNODES_PER_NODE: ${VNODES_PER_NODE:-128}
+      OFFLINE_AFTER_MS: ${OFFLINE_AFTER_MS:-15000}
+      PROBATION_BEATS: ${PROBATION_BEATS:-3}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-104857600}
+      VERIFY_BUFFER_MAX_BYTES: ${VERIFY_BUFFER_MAX_BYTES:-16777216}
+      REGISTER_RATE_LIMIT: ${REGISTER_RATE_LIMIT:-10}
+      LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-10}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  worker:
+    <<: *service
+    build: { context: ., dockerfile: deploy/Dockerfile, target: worker }
+    image: aegisstore/worker:dev
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      NODE_SHARED_SECRET: ${NODE_SHARED_SECRET:?set NODE_SHARED_SECRET in .env}
+      OFFLINE_AFTER_MS: ${OFFLINE_AFTER_MS:-15000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      api: { condition: service_healthy } # the api applies database migrations on boot
+
+  storage-node-1:
+    <<: *service
+    build: { context: ., dockerfile: deploy/Dockerfile, target: storage-node }
+    image: aegisstore/storage-node:dev
+    environment:
+      <<: *node-env
+      NODE_NAME: storage-node-1
+      PUBLIC_URL: http://storage-node-1:4000
+    volumes: ["./runtime/storage-node-1:/data"]
+    healthcheck: *node-healthcheck
+
+  storage-node-2:
+    <<: *service
+    image: aegisstore/storage-node:dev
+    environment:
+      <<: *node-env
+      NODE_NAME: storage-node-2
+      PUBLIC_URL: http://storage-node-2:4000
+    volumes: ["./runtime/storage-node-2:/data"]
+    healthcheck: *node-healthcheck
+    depends_on: [storage-node-1] # same image; makes sure it is built once
+
+  storage-node-3:
+    <<: *service
+    image: aegisstore/storage-node:dev
+    environment:
+      <<: *node-env
+      NODE_NAME: storage-node-3
+      PUBLIC_URL: http://storage-node-3:4000
+    volumes: ["./runtime/storage-node-3:/data"]
+    healthcheck: *node-healthcheck
+    depends_on: [storage-node-1]
+
+  web:
+    <<: *service
+    build: { context: ., dockerfile: deploy/Dockerfile, target: web }
+    image: aegisstore/web:dev
+    ports: ["8080:8080"]
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  aegis-net:
+
+volumes:
+  pgdata:
