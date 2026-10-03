@@ -51,7 +51,7 @@ export async function runGc(db: Db, storage: StorageClient, log: Logger, metrics
   ).rows;
   for (const up of stale) {
     const nodes = (
-      (await db.execute(sql`SELECT id, name, base_url FROM storage_nodes WHERE id = ANY(${up.node_ids}::uuid[])`)) as unknown as {
+      (await db.execute(sql`SELECT id, name, base_url FROM storage_nodes WHERE id IN (${sql.join(up.node_ids.map((id) => sql`${id}::uuid`), sql`, `)})`)) as unknown as {
         rows: { id: string; name: string; base_url: string }[];
       }
     ).rows;

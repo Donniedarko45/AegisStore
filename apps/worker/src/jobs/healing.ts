@@ -46,11 +46,14 @@ interface Candidate {
   size: number;
   storage_class: string;
   target_replicas: number;
+  baseline: number;
   reps: Rep[] | null;
 }
 
 const isDurable = (n: NodeInfo | undefined) => !!n && n.fresh && DURABLE_STATUSES.includes(n.status);
 const isWritable = (n: NodeInfo | undefined, size: number) => !!n && n.fresh && WRITABLE_STATUSES.includes(n.status) && n.free_bytes > size;
+/** last resort for data below its durability baseline: a risky copy beats no second copy */
+const isFallbackTarget = (n: NodeInfo | undefined, size: number) => !!n && n.fresh && n.status === 'HIGH_RISK' && n.free_bytes > size;
 
 let ringCache: { key: string; ring: HashRing } | null = null;
 function ringOf(nodes: NodeInfo[], vnodes: number) {
@@ -112,6 +115,7 @@ export async function reconcile(ctx: WorkerCtx, cfg: HealConfig): Promise<Reconc
         SELECT id, status, coalesce(last_heartbeat_at > now() - make_interval(secs => ${cfg.offlineAfterMs / 1000}), false) AS fresh
           FROM storage_nodes)
       SELECT v.id, o.bucket_id, b.name AS bucket, o.key, v.size, v.storage_class, v.target_replicas,
+             least(v.target_replicas, b.default_replicas) AS baseline,
              json_agg(json_build_object('id', r.id, 'node_id', r.node_id, 'state', r.state)) FILTER (WHERE r.id IS NOT NULL) AS reps
         FROM object_versions v
         JOIN objects o ON o.id = v.object_id
@@ -119,7 +123,7 @@ export async function reconcile(ctx: WorkerCtx, cfg: HealConfig): Promise<Reconc
         LEFT JOIN replicas r ON r.version_id = v.id
         LEFT JOIN n ON n.id = r.node_id
        WHERE v.state = 'ACTIVE' AND v.is_delete_marker = false AND v.blob_id IS NOT NULL
-       GROUP BY v.id, o.bucket_id, b.name, o.key
+       GROUP BY v.id, o.bucket_id, b.name, o.key, b.default_replicas
       HAVING count(*) FILTER (WHERE r.state = 'HEALTHY' AND n.fresh AND n.status IN ('HEALTHY', 'WARNING')) <> v.target_replicas
           OR bool_or(r.state IN ('CORRUPT', 'MISSING'))
           OR bool_or(n.status IN ('HIGH_RISK', 'DRAINING') AND r.state = 'HEALTHY')
@@ -168,10 +172,16 @@ export async function reconcile(ctx: WorkerCtx, cfg: HealConfig): Promise<Reconc
       const broken = reps.find((r) => (r.state === 'CORRUPT' || r.state === 'MISSING') && isWritable(byId.get(r.node_id), v.size));
       let target: string | undefined = broken?.node_id;
       let reason = broken ? (broken.state === 'CORRUPT' ? 'corrupt replica' : 'missing replica') : '';
+      let fallback = false;
       // 2) otherwise the next eligible node clockwise on the ring that holds no copy yet
       if (!target) {
         const holding = new Set(reps.map((r) => r.node_id));
-        const [next] = ring.getNodes(`${v.bucket_id}/${v.key}@${v.id}`, 1, (id) => !holding.has(id) && isWritable(byId.get(id), v.size));
+        const key = `${v.bucket_id}/${v.key}@${v.id}`;
+        let [next] = ring.getNodes(key, 1, (id) => !holding.has(id) && isWritable(byId.get(id), v.size));
+        if (!next && good.length < v.baseline) {
+          [next] = ring.getNodes(key, 1, (id) => !holding.has(id) && isFallbackTarget(byId.get(id), v.size));
+          if (next) fallback = true;
+        }
         target = next;
         const lost = reps.find((r) => !isDurable(byId.get(r.node_id)));
         const lostNode = lost ? byId.get(lost.node_id) : undefined;
@@ -191,8 +201,8 @@ export async function reconcile(ctx: WorkerCtx, cfg: HealConfig): Promise<Reconc
           type: 'REPAIR_REPLICA',
           dedupeKey: `ver:${v.id}`,
           priority,
-          reason,
-          payload: { ...base, targetNodeId: target, targetNode: byId.get(target)?.name, inPlace: !!broken },
+          reason: fallback ? `${reason} (no healthy target: using a high-risk node)` : reason,
+          payload: { ...base, targetNodeId: target, targetNode: byId.get(target)?.name, inPlace: !!broken, fallback },
         })
       )
         status.enqueued++;
@@ -347,7 +357,7 @@ export class JobRunner {
 
   // ------------------------------------------------------------------------------- repair
   private async repair(job: JobRow) {
-    const { versionId, targetNodeId } = job.payload as { versionId: string; targetNodeId: string };
+    const { versionId, targetNodeId, fallback } = job.payload as { versionId: string; targetNodeId: string; fallback?: boolean };
     const [v] = rows<{ id: string; blob_id: string; sha256: string; size: number; state: string; bucket: string; key: string; object_id: string }>(
       await this.ctx.db.execute(sql`
         SELECT v.id, v.blob_id, v.sha256, v.size, v.state, b.name AS bucket, o.key, o.id AS object_id
@@ -359,7 +369,7 @@ export class JobRunner {
     const nodes = await loadNodes(this.ctx, this.cfg);
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const target = byId.get(targetNodeId);
-    if (!isWritable(target, v.size)) throw new Skip(`target ${target?.name ?? targetNodeId} no longer eligible`);
+    if (!isWritable(target, v.size) && !(fallback && isFallbackTarget(target, v.size))) throw new Skip(`target ${target?.name ?? targetNodeId} no longer eligible`);
 
     const reps = rows<Rep & { blob_path: string }>(
       await this.ctx.db.execute(sql`SELECT id, node_id, state, blob_path FROM replicas WHERE version_id = ${versionId}`),

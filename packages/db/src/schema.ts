@@ -324,6 +324,26 @@ export const securityEvents = pgTable(
   (t) => [index('security_events_status_idx').on(t.status, t.createdAt), index('security_events_bucket_actor_idx').on(t.bucketId, t.actorId)],
 );
 
+// ---------------------------------------------------------------- simulation lab (§9.8)
+export const simulationRuns = pgTable(
+  'simulation_runs',
+  {
+    id: id(),
+    /** CHAOS | CORRUPT | TRAFFIC | RANSOMWARE */
+    kind: text('kind').notNull(),
+    /** RUNNING | DONE | FAILED */
+    status: text('status').notNull().default('RUNNING'),
+    params: jsonb('params').$type<Record<string, unknown>>().notNull().default({}),
+    /** which nodes / buckets the run touches: the timeline is the audit trail within this scope */
+    scope: jsonb('scope').$type<{ nodes?: string[]; buckets?: string[] }>().notNull().default({}),
+    summary: jsonb('summary').$type<Record<string, unknown>>(),
+    createdBy: uuid('created_by').references(() => users.id),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+  },
+  (t) => [index('simulation_runs_started_idx').on(t.startedAt)],
+);
+
 // ---------------------------------------------------------------- background jobs
 /**
  * Durable work queue in Postgres (Redis stays disposable). Workers claim rows with

@@ -285,4 +285,24 @@ export class StorageClient {
       throw new CopyError('TARGET_FAILED', (err as Error).message);
     }
   }
+
+  // ------------------------------------------------------------------ simulation lab (chaos)
+  getChaos(node: NodeRef) {
+    return this.json<ChaosState>(node, '/internal/chaos', { method: 'GET' });
+  }
+
+  setChaos(node: NodeRef, patch: Partial<ChaosState>) {
+    return this.json<ChaosState>(node, '/internal/chaos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) });
+  }
+
+  corruptBlob(node: NodeRef, blobId: string) {
+    return this.json<{ ok: boolean }>(node, '/internal/chaos/corrupt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ blobId }) });
+  }
+}
+
+export interface ChaosState {
+  offline: boolean;
+  latencyMs: number;
+  errorRate: number;
+  diskFillPct: number;
 }

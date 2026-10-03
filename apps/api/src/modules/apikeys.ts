@@ -18,6 +18,22 @@ const toDto = (k: typeof apiKeys.$inferSelect) => ({
   createdAt: iso(k.createdAt)!,
 });
 
+/** Create a key; only its hash is stored and the full token is returned exactly once. */
+export async function mintApiKey(ctx: AppContext, userId: string, name: string, scopes: string[], expiresAt: Date | null) {
+  // 8 hex chars => collisions are rare but possible; retry instead of surfacing a 500
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const prefix = randomBytes(4).toString('hex');
+    const secret = randomToken(24).replace(/_/g, '-'); // keep '_' as the field separator
+    try {
+      const [row] = await ctx.db.insert(apiKeys).values({ userId, name, prefix, keyHash: sha256Hex(secret), scopes, expiresAt }).returning();
+      return { row: row!, token: `${API_KEY_PREFIX}_${prefix}_${secret}` };
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+    }
+  }
+  throw new AppError(503, 'INTERNAL', 'Could not allocate an API key, please retry');
+}
+
 export function apiKeyRoutes(app: FastifyInstance, ctx: AppContext) {
   app.get('/api/api-keys', async (req) => {
     const { user } = requireUser(req);
@@ -31,33 +47,10 @@ export function apiKeyRoutes(app: FastifyInstance, ctx: AppContext) {
     if (principal.kind === 'API_KEY') throw AppError.forbidden('API keys cannot create API keys');
     const body = parse(createApiKeySchema, req.body);
 
-    // 8 hex chars => collisions are rare but possible; retry instead of surfacing a 500
-    let row: typeof apiKeys.$inferSelect | undefined;
-    let prefix = '';
-    let secret = '';
-    for (let attempt = 0; attempt < 5 && !row; attempt++) {
-      prefix = randomBytes(4).toString('hex');
-      secret = randomToken(24).replace(/_/g, '-'); // keep '_' as the field separator
-      try {
-        [row] = await ctx.db
-          .insert(apiKeys)
-          .values({
-            userId: principal.user.id,
-            name: body.name,
-            prefix,
-            keyHash: sha256Hex(secret),
-            scopes: body.scopes,
-            expiresAt: body.expiresInDays ? new Date(Date.now() + body.expiresInDays * 86_400_000) : null,
-          })
-          .returning();
-      } catch (err) {
-        if (!isUniqueViolation(err)) throw err;
-      }
-    }
-    if (!row) throw new AppError(503, 'INTERNAL', 'Could not allocate an API key, please retry');
+    const { row, token } = await mintApiKey(ctx, principal.user.id, body.name, body.scopes, body.expiresInDays ? new Date(Date.now() + body.expiresInDays * 86_400_000) : null);
     await audit(ctx, req, { action: 'apikey.create', resourceType: 'api_key', resourceId: row.id, metadata: { name: body.name, scopes: body.scopes } });
     // the full key is returned exactly once; only its hash is stored
-    return reply.code(201).send({ ...toDto(row), key: `${API_KEY_PREFIX}_${prefix}_${secret}` });
+    return reply.code(201).send({ ...toDto(row), key: token });
   });
 
   app.delete<{ Params: { id: string } }>('/api/api-keys/:id', async (req) => {

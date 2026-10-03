@@ -3,6 +3,7 @@ import { open, readFile, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { NodeMetrics } from '@aegis/shared';
+import type { Chaos } from './chaos';
 
 const WINDOW_MS = 60_000;
 
@@ -45,18 +46,23 @@ export class MetricsCollector {
    * Disk health probe: write 4 KB, fsync, read it back and delete it. Request latency only exists
    * when there is traffic; the probe gives a real I/O latency signal even on an idle node.
    */
-  async probe(dataDir: string): Promise<number> {
+  async probe(dataDir: string, chaos?: Chaos): Promise<number> {
     const file = path.join(dataDir, 'tmp', '.probe');
     const t0 = performance.now();
     try {
+      // injected faults affect the probe like they affect real I/O (so an idle node shows them too)
+      await chaos?.delay();
+      if (chaos?.shouldFail()) throw new Error('injected I/O error');
       const fh = await open(file, 'w');
       await fh.write(randomBytes(4096));
       await fh.sync();
       await fh.close();
       await readFile(file);
       await unlink(file);
+      this.record(null, false);
       return Math.round((performance.now() - t0) * 100) / 100;
     } catch {
+      this.record(null, true); // a failed probe counts toward the error rate
       return -1; // reported as an error rather than a fake latency
     }
   }

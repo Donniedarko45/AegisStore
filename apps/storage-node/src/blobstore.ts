@@ -42,6 +42,8 @@ export class BlobStore {
   blobCount = 0;
   /** bytes held by multipart parts that are not composed yet */
   partsBytes = 0;
+  /** simulated fill (Simulation Lab): the disk reports and behaves as at least this full */
+  virtualFillPct = 0;
 
   constructor(
     root: string,
@@ -86,8 +88,13 @@ export class BlobStore {
     return `blobs/${id.slice(0, 2)}/${id}`;
   }
 
+  /** what the node reports as used: real data, or the simulated fill when that is higher */
+  get reportedUsedBytes(): number {
+    return Math.max(this.usedBytes + this.partsBytes, Math.round((this.virtualFillPct / 100) * this.capacityBytes));
+  }
+
   hasCapacityFor(bytes: number): boolean {
-    return this.usedBytes + this.partsBytes + bytes <= this.capacityBytes;
+    return this.reportedUsedBytes + bytes <= this.capacityBytes;
   }
 
   async stage(blobId: string, body: Readable): Promise<StagedBlob> {

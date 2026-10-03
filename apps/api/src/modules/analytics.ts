@@ -100,6 +100,29 @@ export function analyticsRoutes(app: FastifyInstance, ctx: AppContext) {
           FROM (${current}) c GROUP BY 1`),
     );
     const order = ['< 1 KB', '1–100 KB', '100 KB–1 MB', '1–10 MB', '≥ 10 MB'];
+    // access classes (§9.3): what is HOT / WARM / COLD right now, and how often each is read
+    const byClass = rowsOf<{ class: string; objects: number; bytes: number; reads24h: number; replicas: number }>(
+      await ctx.db.execute(sql`
+        SELECT c.storage_class AS class, count(*)::int AS objects, coalesce(sum(c.size), 0)::bigint AS bytes,
+               coalesce(sum((SELECT sum(reads) FROM object_access a WHERE a.object_id = c.object_id AND a.hour > now() - interval '24 hours')), 0)::int AS reads24h,
+               coalesce(sum(c.available), 0)::int AS replicas
+          FROM (${current}) c GROUP BY 1`),
+    );
+    const classChanges = rowsOf<{ t: Date; promoted: number; demoted: number }>(
+      await ctx.db.execute(sql`
+        WITH bins AS (
+          SELECT generate_series(date_bin(${step}::interval, now() - ${interval}::interval, 'epoch'::timestamptz),
+                                 date_bin(${step}::interval, now(), 'epoch'::timestamptz), ${step}::interval) AS t
+        ), ev AS (
+          SELECT date_bin(${step}::interval, created_at, 'epoch'::timestamptz) AS t, metadata->>'to' AS to_class, metadata->>'from' AS from_class
+            FROM audit_logs WHERE action = 'object.class_changed' AND created_at >= now() - ${interval}::interval - ${step}::interval
+             AND metadata->>'bucket' IN (SELECT name FROM buckets WHERE id IN ${visible})
+        )
+        SELECT b.t,
+               count(ev.t) FILTER (WHERE ev.to_class = 'HOT')::int AS promoted,
+               count(ev.t) FILTER (WHERE ev.from_class = 'HOT' OR ev.to_class = 'COLD')::int AS demoted
+          FROM bins b LEFT JOIN ev ON ev.t = b.t GROUP BY b.t ORDER BY b.t`),
+    );
     const topDownloads = rowsOf<{ bucket: string; key: string; downloads: number; bytes: number }>(
       await ctx.db.execute(sql`
         SELECT metadata->>'bucket' AS bucket, metadata->>'key' AS key, count(*)::int AS downloads,
@@ -137,6 +160,11 @@ export function analyticsRoutes(app: FastifyInstance, ctx: AppContext) {
       integrity: integrity ?? { healthy: 0, degraded: 0, unavailable: 0 },
       sizeHistogram: order.map((b) => ({ bucket: b, objects: sizes.find((s) => s.bucket === b)?.objects ?? 0 })),
       topDownloads: topDownloads.map((r) => ({ ...r, bytes: Number(r.bytes) })),
+      byClass: ['HOT', 'WARM', 'COLD'].map((k) => {
+        const r = byClass.find((x) => x.class === k);
+        return { class: k, objects: r?.objects ?? 0, bytes: Number(r?.bytes ?? 0), reads24h: r?.reads24h ?? 0, replicas: r?.replicas ?? 0 };
+      }),
+      classChanges: classChanges.map((r) => ({ t: iso(r.t), promoted: r.promoted, demoted: r.demoted })),
     };
   });
 }

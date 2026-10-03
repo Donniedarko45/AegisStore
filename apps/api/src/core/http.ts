@@ -1,5 +1,6 @@
 import { AppError } from '@aegis/shared';
 import type { z } from 'zod';
+import { sql, type SQL } from '@aegis/db';
 
 /** Validate untrusted input with zod and surface a clean 400. */
 export function parse<T extends z.ZodTypeAny>(schema: T, data: unknown): z.infer<T> {
@@ -30,3 +31,10 @@ export function isUniqueViolation(err: unknown): boolean {
   const e = err as { code?: string; cause?: { code?: string } };
   return e?.code === '23505' || e?.cause?.code === '23505';
 }
+
+/**
+ * A Postgres text[] literal from a JS array. (Passing the array as one parameter makes the driver
+ * expand it into a row list, which `= ANY(...)` rejects.)
+ */
+export const textArray = (items: readonly string[]): SQL =>
+  items.length ? sql`ARRAY[${sql.join(items.map((i) => sql`${i}`), sql`, `)}]::text[]` : sql`ARRAY[]::text[]`;

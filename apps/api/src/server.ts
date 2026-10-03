@@ -19,6 +19,7 @@ import { healingRoutes } from './modules/healing';
 import { securityRoutes } from './modules/security';
 import { multipartRoutes } from './modules/multipart';
 import { shareRoutes } from './modules/shares';
+import { simulationRoutes } from './modules/simulation';
 import { userRoutes } from './modules/users';
 import { registerAuth } from './plugins/auth';
 
@@ -105,6 +106,7 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   securityRoutes(app, ctx);
   multipartRoutes(app, ctx);
   shareRoutes(app, ctx);
+  simulationRoutes(app, ctx);
   const hub = createEventHub(ctx.cfg.REDIS_URL, ctx.log);
   app.addHook('onClose', async () => hub.close());
   eventRoutes(app, ctx, hub);
