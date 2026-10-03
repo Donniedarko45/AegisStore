@@ -54,6 +54,8 @@ const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 64 });
 const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64 });
 
 const CONTROL_TIMEOUT_MS = 10_000;
+/** composing a multi-GB object reads and writes every byte once */
+const COMPOSE_TIMEOUT_MS = 10 * 60_000;
 
 /** Typed client for the storage nodes' internal API. Knows nothing about buckets or users. */
 export class StorageClient {
@@ -67,7 +69,7 @@ export class StorageClient {
     const res = await fetch(`${node.baseUrl}${path}`, {
       ...init,
       headers: { ...this.headers(requestId), ...(init.headers as Record<string, string> | undefined) },
-      signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+      signal: AbortSignal.timeout(path.endsWith('/compose') ? COMPOSE_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     });
     if (!res.ok) throw new NodeHttpError(res.status, `${node.name}: ${path} -> ${res.status}`);
     return (await res.json()) as T;
@@ -75,7 +77,31 @@ export class StorageClient {
 
   /** Start a streamed PUT to `node`. The caller writes chunks and then calls `end()`. */
   startStage(node: NodeRef, blobId: string, opts: { requestId?: string; expectedSize?: number } = {}): StageSink {
-    const url = new URL(`${node.baseUrl}/internal/blobs/${blobId}/stage`);
+    return this.startPut(node, `/internal/blobs/${blobId}/stage`, opts);
+  }
+
+  /** Streamed PUT of one multipart part (same sink contract as a stage). */
+  startPart(node: NodeRef, uploadId: string, partNo: number, opts: { requestId?: string; expectedSize?: number } = {}): StageSink {
+    return this.startPut(node, `/internal/parts/${uploadId}/${partNo}`, opts);
+  }
+
+  /** Concatenate an upload's parts into a committed blob on the node. */
+  compose(node: NodeRef, uploadId: string, blobId: string, parts: number[], requestId?: string) {
+    return this.json<{ size: number; sha256: string; path: string }>(
+      node,
+      `/internal/parts/${uploadId}/compose`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ blobId, parts }) },
+      requestId,
+    );
+  }
+
+  /** Best effort: remove an upload's parts from the node. */
+  abortParts(node: NodeRef, uploadId: string) {
+    return this.json(node, `/internal/parts/${uploadId}`, { method: 'DELETE' }).catch(() => undefined);
+  }
+
+  private startPut(node: NodeRef, path: string, opts: { requestId?: string; expectedSize?: number }): StageSink {
+    const url = new URL(`${node.baseUrl}${path}`);
     const secure = url.protocol === 'https:';
     const req = (secure ? httpsRequest : httpRequest)(
       {

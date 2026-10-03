@@ -13,7 +13,7 @@ import {
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AppContext } from '../context';
 import { requireBucket, type BucketRow } from '../core/access';
-import { audit } from '../core/audit';
+import { audit, type AuditEntry } from '../core/audit';
 import { fanoutStage } from '../core/fanout';
 import { iso, parse, rowsOf } from '../core/http';
 import { HashRing } from '@aegis/hashring';
@@ -31,7 +31,7 @@ type Q = { key?: string; versionId?: string };
 export const integrityOf = (available: number, target: number, baseline = target): IntegrityStatus =>
   available >= Math.min(target, baseline) ? 'HEALTHY' : available === 0 ? 'UNAVAILABLE' : 'DEGRADED';
 
-function keyFrom(q: Q): string {
+export function keyFrom(q: Q): string {
   try {
     return validateObjectKey(q.key);
   } catch (e) {
@@ -51,7 +51,7 @@ function assertNotLocked(bucket: BucketRow, what: string) {
 const isProtectedNow = (v: { isProtected: boolean; protectedUntil: Date | null }) =>
   v.isProtected && (!v.protectedUntil || v.protectedUntil.getTime() > Date.now());
 
-async function findObject(ctx: AppContext, bucketId: string, key: string) {
+export async function findObject(ctx: AppContext, bucketId: string, key: string) {
   const [row] = await ctx.db
     .select()
     .from(objects)
@@ -506,25 +506,26 @@ function registerUpload(app: FastifyInstance, ctx: AppContext) {
   });
 }
 
-async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { bucket: string }; Querystring: Q }>) {
-  const principal = requireUser(req);
-  const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'WRITE');
-  const key = keyFrom(req.query);
+export interface PendingVersion {
+  bucket: BucketRow;
+  key: string;
+  contentType: string;
+  wanted: number;
+  versionId: string;
+  blobId: string;
+  blobPath: string;
+  placementKey: string;
+  nodes: NodeRow[];
+  objectId: string;
+  versionNo: number;
+  prev: { entropy: number | null } | null;
+  startedAt: Date;
+}
 
-  const declared = Number(req.headers['content-length']);
-  const expectedSize = Number.isFinite(declared) ? declared : undefined;
-  if (expectedSize !== undefined && expectedSize > ctx.cfg.MAX_UPLOAD_BYTES) {
-    throw new AppError(413, 'PAYLOAD_TOO_LARGE', `Single uploads are limited to ${ctx.cfg.MAX_UPLOAD_BYTES} bytes`);
-  }
-  if (bucket.protectedMode) {
-    const existing = await findObject(ctx, bucket.id, key);
-    if (existing?.currentVersionId) assertNotLocked(bucket, 'overwriting objects');
-  }
-  const contentType = String(req.headers['content-type'] ?? 'application/octet-stream').slice(0, 255);
+/** Pick R nodes on the ring for a new version of `key`; 503 when fewer are available. */
+export async function placeVersion(ctx: AppContext, bucket: BucketRow, key: string, expectedSize?: number) {
   const wanted = bucket.defaultReplicas;
   const versionId = randomUUID();
-  const blobId = randomUUID();
-
   const placementKey = `${bucket.id}/${key}@${versionId}`;
   const nodes = await pickNodes(ctx.db, placementKey, {
     replicas: wanted,
@@ -539,10 +540,32 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
       `Need ${wanted} healthy storage nodes but only ${nodes.length} available. Upload rejected to protect durability.`,
     );
   }
+  return { wanted, versionId, placementKey, nodes };
+}
 
-  // 1. record intent (PENDING) so a crash leaves a cleanable trail, never a half-visible object
+/** Refuse to overwrite an existing object in a locked bucket (checked again at finalize). */
+export async function assertWritable(ctx: AppContext, bucket: BucketRow, key: string) {
+  if (!bucket.protectedMode) return;
+  const existing = await findObject(ctx, bucket.id, key);
+  if (existing?.currentVersionId) assertNotLocked(bucket, 'overwriting objects');
+}
+
+/**
+ * Step 1 of every write: record intent (a PENDING version and PENDING replica rows) so a crash
+ * leaves a cleanable trail, never a half-visible object.
+ */
+export async function beginVersion(
+  ctx: AppContext,
+  userId: string,
+  bucket: BucketRow,
+  key: string,
+  contentType: string,
+  placed: Awaited<ReturnType<typeof placeVersion>>,
+  blobId: string = randomUUID(),
+): Promise<PendingVersion> {
+  const { versionId, nodes, wanted } = placed;
   const blobPath = `blobs/${blobId.slice(0, 2)}/${blobId}`;
-  const { objectId, versionNo, prev, startedAt } = await ctx.db.transaction(async (tx) => {
+  const row = await ctx.db.transaction(async (tx) => {
     const [obj] = await tx
       .insert(objects)
       .values({ bucketId: bucket.id, key })
@@ -554,19 +577,10 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
       .where(eq(objectVersions.objectId, obj!.id));
     const [created] = await tx
       .insert(objectVersions)
-      .values({
-        id: versionId,
-        objectId: obj!.id,
-        versionNo: n + 1,
-        contentType,
-        blobId,
-        state: 'PENDING',
-        targetReplicas: wanted,
-        createdBy: principal.user.id,
-      })
+      .values({ id: versionId, objectId: obj!.id, versionNo: n + 1, contentType, blobId, state: 'PENDING', targetReplicas: wanted, createdBy: userId })
       .returning({ createdAt: objectVersions.createdAt });
     await tx.insert(replicas).values(nodes.map((node) => ({ versionId, nodeId: node.id, blobPath, state: 'PENDING' as const })));
-    // what this upload replaces (ransomware heuristics compare the old and new entropy)
+    // what this write replaces (ransomware heuristics compare the old and new entropy)
     const [prevRow] = await tx
       .select({ entropy: objectVersions.entropy })
       .from(objects)
@@ -574,10 +588,155 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
       .where(eq(objects.id, obj!.id));
     return { objectId: obj!.id, versionNo: n + 1, prev: prevRow ?? null, startedAt: created!.createdAt };
   });
+  return { bucket, key, contentType, wanted, versionId, blobId, blobPath, placementKey: placed.placementKey, nodes, ...row };
+}
 
-  const discard = async () => {
-    await ctx.db.delete(objectVersions).where(eq(objectVersions.id, versionId)).catch(() => undefined);
+export const discardVersion = (ctx: AppContext, pv: PendingVersion) =>
+  ctx.db.delete(objectVersions).where(eq(objectVersions.id, pv.versionId)).catch(() => undefined);
+
+export type Holder = { node: NodeRow; path: string; fallbackFor?: string };
+
+/**
+ * Steps 4b-5 of every write, given the nodes that hold a verified, committed copy:
+ *  - replace lost copies on the next eligible ring nodes (verified node-to-node copy), so a node
+ *    failing mid-upload does not fail the upload
+ *  - activate the version atomically (overwrite semantics, bucket lock re-checked), audit, publish
+ */
+export async function finishVersion(
+  ctx: AppContext,
+  req: FastifyRequest,
+  pv: PendingVersion,
+  input: { holders: Holder[]; lost: { node: { name: string }; reason: string }[]; sha256: string; size: number; entropy: number | null; audit?: Record<string, unknown> },
+) {
+  const { bucket, key, versionId, blobId, wanted } = pv;
+  const holders = [...input.holders];
+  const rollback = async () => {
+    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
+    await discardVersion(ctx, pv);
   };
+
+  const tried = new Set([...pv.nodes.map((n) => n.id), ...holders.map((h) => h.node.id)]);
+  for (const l of input.lost) {
+    if (holders.length >= wanted) break;
+    let replaced = false;
+    while (!replaced) {
+      const [next] = await pickNodes(ctx.db, pv.placementKey, {
+        replicas: 1,
+        vnodes: ctx.cfg.VNODES_PER_NODE,
+        offlineAfterMs: ctx.cfg.OFFLINE_AFTER_MS,
+        expectedSize: input.size,
+        exclude: tried,
+      });
+      if (!next) break;
+      tried.add(next.id);
+      await ctx.db.insert(replicas).values({ versionId, nodeId: next.id, blobPath: pv.blobPath, state: 'PENDING' }).onConflictDoNothing();
+      try {
+        const c = await ctx.storage.copyBlob(holders[0]!.node, next, blobId, { sha256: input.sha256, size: input.size }, req.id);
+        holders.push({ node: next, path: c.path, fallbackFor: l.node.name });
+        replaced = true;
+        req.log.warn({ failed: l.node.name, replacement: next.name, reason: l.reason }, 'write fell back to the next ring node');
+      } catch (err) {
+        req.log.warn({ node: next.name, err: (err as Error).message }, 'fallback copy failed; trying the next node');
+      }
+    }
+  }
+  if (holders.length < wanted) {
+    await rollback();
+    throw new AppError(
+      502,
+      'UPLOAD_FAILED',
+      `Only ${holders.length} of ${wanted} copies could be stored (${input.lost.map((l) => `${l.node.name}: ${l.reason}`).join('; ')}); nothing was kept. Please retry.`,
+    );
+  }
+
+  const holderIds = holders.map((h) => h.node.id);
+  const retention = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
+  const finalized = await ctx.db.transaction(async (tx) => {
+    // Only a still-PENDING version may be activated. If the GC already reaped it (a write that
+    // took longer than the abandoned-upload timeout) we must not point the object at a ghost row.
+    const activated = await tx
+      .update(objectVersions)
+      .set({ state: 'ACTIVE', size: input.size, sha256: input.sha256, entropy: input.entropy })
+      .where(and(eq(objectVersions.id, versionId), eq(objectVersions.state, 'PENDING')))
+      .returning({ id: objectVersions.id });
+    if (activated.length === 0) return false;
+    const [locked] = await tx.select().from(objects).where(eq(objects.id, pv.objectId)).for('update');
+    // the bucket may have been locked by the anomaly detector while this write was streaming
+    const [b] = await tx.select({ protectedMode: buckets.protectedMode }).from(buckets).where(eq(buckets.id, bucket.id));
+    if (b?.protectedMode && locked?.currentVersionId) return 'locked' as const;
+    await tx
+      .update(replicas)
+      .set({ state: 'HEALTHY', sha256: input.sha256, lastVerifiedAt: new Date() })
+      .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, holderIds)));
+    await tx.delete(replicas).where(and(eq(replicas.versionId, versionId), notInArray(replicas.nodeId, holderIds)));
+    if (locked?.currentVersionId && !bucket.versioningEnabled) {
+      // overwrite without versioning: the old bytes stay recoverable until the retention purge
+      await tx
+        .update(objectVersions)
+        .set({ state: 'DELETED', deletedAt: new Date(), purgeAfter: retention })
+        .where(eq(objectVersions.id, locked.currentVersionId));
+    }
+    await tx.update(objects).set({ currentVersionId: versionId, updatedAt: new Date() }).where(eq(objects.id, pv.objectId));
+    return true;
+  });
+  if (finalized !== true) {
+    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
+    if (finalized === 'locked') {
+      await discardVersion(ctx, pv);
+      assertNotLocked({ ...bucket, protectedMode: true }, 'overwriting objects');
+    }
+    throw new AppError(502, 'UPLOAD_FAILED', 'Upload took too long and was cleaned up as abandoned; please retry.');
+  }
+  const fallback = holders.filter((h) => h.fallbackFor).map((h) => ({ failed: h.fallbackFor, replacement: h.node.name }));
+
+  await audit(ctx, req, {
+    action: 'object.upload',
+    resourceType: 'object',
+    resourceId: pv.objectId,
+    metadata: {
+      bucket: bucket.name,
+      key,
+      size: input.size,
+      sha256: input.sha256,
+      versionNo: pv.versionNo,
+      nodes: holders.map((h) => h.node.name),
+      overwrite: !!pv.prev,
+      // when the version row was created (the audit entry is written when the upload finishes)
+      startedAt: pv.startedAt.toISOString(),
+      entropy: input.entropy,
+      ...(pv.prev && { prevEntropy: pv.prev.entropy }),
+      ...(fallback.length && { fallback }),
+      ...input.audit,
+    },
+  });
+  void publishEvent(ctx.redis, 'object.created', { bucket: bucket.name, key, size: input.size });
+
+  return {
+    key,
+    versionId,
+    versionNo: pv.versionNo,
+    size: input.size,
+    sha256: input.sha256,
+    contentType: pv.contentType,
+    replicas: holders.map((h) => ({ node: h.node.name, path: h.path, ...(h.fallbackFor && { fallbackFor: h.fallbackFor }) })),
+  };
+}
+
+async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { bucket: string }; Querystring: Q }>) {
+  const principal = requireUser(req);
+  const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'WRITE');
+  const key = keyFrom(req.query);
+
+  const declared = Number(req.headers['content-length']);
+  const expectedSize = Number.isFinite(declared) ? declared : undefined;
+  if (expectedSize !== undefined && expectedSize > ctx.cfg.MAX_UPLOAD_BYTES) {
+    throw new AppError(413, 'PAYLOAD_TOO_LARGE', `Single uploads are limited to ${ctx.cfg.MAX_UPLOAD_BYTES} bytes; use a multipart upload for larger files`);
+  }
+  await assertWritable(ctx, bucket, key);
+  const contentType = String(req.headers['content-type'] ?? 'application/octet-stream').slice(0, 255);
+  const placed = await placeVersion(ctx, bucket, key, expectedSize);
+  const pv = await beginVersion(ctx, principal.user.id, bucket, key, contentType, placed);
+  const { nodes, blobId } = pv;
 
   // 2. stream to every replica node while hashing once. A node that fails mid-stream is dropped;
   //    the upload carries on as long as one copy is still being written.
@@ -586,7 +745,7 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
   try {
     stats = await fanoutStage(req.raw, sinks, { maxBytes: ctx.cfg.MAX_UPLOAD_BYTES, minSinks: 1 });
   } catch (err) {
-    await discard();
+    await discardVersion(ctx, pv);
     if (err instanceof AppError) throw err;
     throw new AppError(502, 'UPLOAD_FAILED', `Upload failed while streaming to storage nodes: ${(err as Error).message}`);
   }
@@ -608,11 +767,11 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     } else good.push({ node, staged: s.value });
   }
   if (mismatched.length) {
-    await audit(ctx, req, { action: 'object.upload_checksum_mismatch', resourceType: 'object', resourceId: objectId, metadata: { bucket: bucket.name, key, nodes: mismatched } });
+    await audit(ctx, req, { action: 'object.upload_checksum_mismatch', resourceType: 'object', resourceId: pv.objectId, metadata: { bucket: bucket.name, key, nodes: mismatched } });
   }
 
   // 4. commit on the good nodes (atomic rename)
-  const holders: { node: NodeRow; path: string; fallbackFor?: string }[] = [];
+  const holders: Holder[] = [];
   const committed = await Promise.allSettled(good.map((g) => ctx.storage.commit(g.node, blobId, g.staged.stagedToken, req.id)));
   for (const [i, c] of committed.entries()) {
     const g = good[i]!;
@@ -622,124 +781,13 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
       await ctx.storage.abort(g.node, blobId, g.staged.stagedToken);
     }
   }
-  const rollback = async () => {
-    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
-    await discard();
-  };
   if (!holders.length) {
-    await discard();
+    await discardVersion(ctx, pv);
     if (mismatched.length) throw new AppError(502, 'CHECKSUM_MISMATCH', `Checksum mismatch on ${mismatched.join(', ')}; nothing was stored. Please retry.`);
     throw new AppError(502, 'UPLOAD_FAILED', `Storage node error: ${lost.map((l) => `${l.node.name}: ${l.reason}`).join('; ')}`);
   }
 
-  // 4b. replace lost copies: the next eligible node clockwise on the ring receives a verified copy
-  //     of a committed replica (node -> API -> node, hashed in flight), so the upload still ends
-  //     with R verified replicas instead of failing.
-  const tried = new Set(nodes.map((n) => n.id));
-  for (const l of lost) {
-    if (holders.length >= wanted) break;
-    let replaced = false;
-    while (!replaced) {
-      const [next] = await pickNodes(ctx.db, placementKey, {
-        replicas: 1,
-        vnodes: ctx.cfg.VNODES_PER_NODE,
-        offlineAfterMs: ctx.cfg.OFFLINE_AFTER_MS,
-        expectedSize: stats.size,
-        exclude: tried,
-      });
-      if (!next) break;
-      tried.add(next.id);
-      await ctx.db.insert(replicas).values({ versionId, nodeId: next.id, blobPath, state: 'PENDING' }).onConflictDoNothing();
-      try {
-        const c = await ctx.storage.copyBlob(holders[0]!.node, next, blobId, { sha256: stats.sha256, size: stats.size }, req.id);
-        holders.push({ node: next, path: c.path, fallbackFor: l.node.name });
-        replaced = true;
-        req.log.warn({ failed: l.node.name, replacement: next.name, reason: l.reason }, 'upload fell back to the next ring node');
-      } catch (err) {
-        req.log.warn({ node: next.name, err: (err as Error).message }, 'fallback copy failed; trying the next node');
-      }
-    }
-  }
-  if (holders.length < wanted) {
-    await rollback();
-    throw new AppError(
-      502,
-      'UPLOAD_FAILED',
-      `Only ${holders.length} of ${wanted} copies could be stored (${lost.map((l) => `${l.node.name}: ${l.reason}`).join('; ')}); nothing was kept. Please retry.`,
-    );
-  }
-
-  // 5. make it visible atomically
-  const holderIds = holders.map((h) => h.node.id);
-  const retention = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
-  const finalized = await ctx.db.transaction(async (tx) => {
-    // Only a still-PENDING version may be activated. If the GC already reaped it (an upload that
-    // took longer than the abandoned-upload timeout) we must not point the object at a ghost row.
-    const activated = await tx
-      .update(objectVersions)
-      .set({ state: 'ACTIVE', size: stats.size, sha256: stats.sha256, entropy: stats.entropy })
-      .where(and(eq(objectVersions.id, versionId), eq(objectVersions.state, 'PENDING')))
-      .returning({ id: objectVersions.id });
-    if (activated.length === 0) return false;
-    const [locked] = await tx.select().from(objects).where(eq(objects.id, objectId)).for('update');
-    // the bucket may have been locked by the anomaly detector while this upload was streaming
-    const [b] = await tx.select({ protectedMode: buckets.protectedMode }).from(buckets).where(eq(buckets.id, bucket.id));
-    if (b?.protectedMode && locked?.currentVersionId) return 'locked' as const;
-    await tx
-      .update(replicas)
-      .set({ state: 'HEALTHY', sha256: stats.sha256, lastVerifiedAt: new Date() })
-      .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, holderIds)));
-    await tx.delete(replicas).where(and(eq(replicas.versionId, versionId), notInArray(replicas.nodeId, holderIds)));
-    if (locked?.currentVersionId && !bucket.versioningEnabled) {
-      // overwrite without versioning: the old bytes stay recoverable until the retention purge
-      await tx
-        .update(objectVersions)
-        .set({ state: 'DELETED', deletedAt: new Date(), purgeAfter: retention })
-        .where(eq(objectVersions.id, locked.currentVersionId));
-    }
-    await tx.update(objects).set({ currentVersionId: versionId, updatedAt: new Date() }).where(eq(objects.id, objectId));
-    return true;
-  });
-  if (finalized !== true) {
-    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
-    if (finalized === 'locked') {
-      await discard();
-      assertNotLocked({ ...bucket, protectedMode: true }, 'overwriting objects');
-    }
-    throw new AppError(502, 'UPLOAD_FAILED', 'Upload took too long and was cleaned up as abandoned; please retry.');
-  }
-  const fallback = holders.filter((h) => h.fallbackFor).map((h) => ({ failed: h.fallbackFor, replacement: h.node.name }));
-
-  await audit(ctx, req, {
-    action: 'object.upload',
-    resourceType: 'object',
-    resourceId: objectId,
-    metadata: {
-      bucket: bucket.name,
-      key,
-      size: stats.size,
-      sha256: stats.sha256,
-      versionNo,
-      nodes: holders.map((h) => h.node.name),
-      overwrite: !!prev,
-      // when the version row was created (the audit entry is written when the upload finishes)
-      startedAt: startedAt.toISOString(),
-      entropy: stats.entropy,
-      ...(prev && { prevEntropy: prev.entropy }),
-      ...(fallback.length && { fallback }),
-    },
-  });
-  void publishEvent(ctx.redis, 'object.created', { bucket: bucket.name, key, size: stats.size });
-
-  return {
-    key,
-    versionId,
-    versionNo,
-    size: stats.size,
-    sha256: stats.sha256,
-    contentType,
-    replicas: holders.map((h) => ({ node: h.node.name, path: h.path, ...(h.fallbackFor && { fallbackFor: h.fallbackFor }) })),
-  };
+  return finishVersion(ctx, req, pv, { holders, lost, sha256: stats.sha256, size: stats.size, entropy: stats.entropy });
 }
 
 // =============================================================================================
@@ -784,13 +832,14 @@ async function flagReplica(
   void publishEvent(ctx.redis, 'replica.flagged', { node: node.name, state, versionId: replica.versionId });
 }
 
-async function serveObject(
+export async function serveObject(
   ctx: AppContext,
   req: FastifyRequest,
   reply: FastifyReply,
   bucket: BucketRow,
   key: string,
   version: typeof objectVersions.$inferSelect,
+  opts: { actor?: AuditEntry['actor'] } = {},
 ) {
   const candidates = await ctx.db
     .select({ r: replicas, node: storageNodes })
@@ -850,7 +899,7 @@ async function serveObject(
           reply.removeHeader('x-aegis-served-by');
           continue;
         }
-        await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, fallbacks: attempts.length } });
+        await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, actor: opts.actor, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, fallbacks: attempts.length } });
         recordAccess(ctx, version.objectId, version.size);
         return reply.header('x-aegis-integrity', 'verified').send(body);
       } catch (err) {
@@ -877,7 +926,7 @@ async function serveObject(
         cb(new Error('checksum mismatch'));
       },
     });
-    await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, streamed: true } });
+    await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, actor: opts.actor, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, streamed: true } });
     recordAccess(ctx, version.objectId, version.size);
     track(node.id, 1);
     reply.raw.once('close', () => track(node.id, -1));

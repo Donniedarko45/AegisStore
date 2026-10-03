@@ -11,8 +11,8 @@ const api = { target, changeOrigin: false, xfwd: true };
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  server: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/healthz': api } },
-  preview: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/healthz': api } },
+  server: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/s/': api, '/healthz': api } },
+  preview: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/s/': api, '/healthz': api } },
   build: {
     sourcemap: false,
     rollupOptions: {

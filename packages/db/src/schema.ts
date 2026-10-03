@@ -235,6 +235,62 @@ export const nodeMetrics = pgTable(
   (t) => [index('node_metrics_node_ts_idx').on(t.nodeId, t.ts)],
 );
 
+// ---------------------------------------------------------------- large files & sharing (§6.7, §6.8)
+export const multipartUploads = pgTable(
+  'multipart_uploads',
+  {
+    id: id(),
+    bucketId: uuid('bucket_id').notNull().references(() => buckets.id),
+    key: text('key').notNull(),
+    contentType: text('content_type').notNull().default('application/octet-stream'),
+    createdBy: uuid('created_by').references(() => users.id),
+    /** the R nodes chosen on the ring when the upload started; every part goes to them */
+    nodeIds: uuid('node_ids').array().notNull(),
+    /** ACTIVE | COMPLETED | ABORTED */
+    state: text('state').notNull().default('ACTIVE'),
+    versionId: uuid('version_id'),
+    createdAt: createdAt(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [index('multipart_uploads_state_idx').on(t.state, t.expiresAt), index('multipart_uploads_bucket_idx').on(t.bucketId)],
+);
+
+export const multipartParts = pgTable(
+  'multipart_parts',
+  {
+    uploadId: uuid('upload_id').notNull().references(() => multipartUploads.id, { onDelete: 'cascade' }),
+    partNo: integer('part_no').notNull(),
+    size: bytes('size').notNull(),
+    sha256: text('sha256').notNull(),
+    /** nodes that hold a verified copy of this part */
+    nodeIds: uuid('node_ids').array().notNull(),
+    entropy: real('entropy'),
+    createdAt: createdAt(),
+  },
+  (t) => [primaryKey({ columns: [t.uploadId, t.partNo] })],
+);
+
+/** Time-limited, login-free download links. The token is <id>.<HMAC>; this row makes them revocable. */
+export const shareLinks = pgTable(
+  'share_links',
+  {
+    id: id(),
+    bucketId: uuid('bucket_id').notNull().references(() => buckets.id),
+    objectId: uuid('object_id').notNull().references(() => objects.id),
+    /** links are pinned to the version that was current when they were made */
+    versionId: uuid('version_id').notNull(),
+    key: text('key').notNull(),
+    createdBy: uuid('created_by').references(() => users.id),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    maxDownloads: integer('max_downloads'),
+    downloads: integer('downloads').notNull().default(0),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: createdAt(),
+  },
+  (t) => [index('share_links_object_idx').on(t.objectId)],
+);
+
 // ---------------------------------------------------------------- security (§9.5, §9.6)
 export const securityEvents = pgTable(
   'security_events',

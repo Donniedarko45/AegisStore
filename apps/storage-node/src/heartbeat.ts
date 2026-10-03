@@ -18,7 +18,7 @@ export function startHeartbeat(
       name: cfg.NODE_NAME,
       baseUrl: cfg.publicUrl,
       metrics: metrics.snapshot(
-        { usedBytes: store.usedBytes, capacityBytes: cfg.NODE_CAPACITY_BYTES, blobCount: store.blobCount },
+        { usedBytes: store.usedBytes + store.partsBytes, capacityBytes: cfg.NODE_CAPACITY_BYTES, blobCount: store.blobCount },
         probeMs,
       ),
     };

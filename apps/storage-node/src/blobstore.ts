@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream, type ReadStream } from 'node:fs';
-import { mkdir, open, readdir, rename, stat, unlink } from 'node:fs/promises';
+import { mkdir, open, readdir, rename, rmdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -37,8 +37,11 @@ export interface StagedBlob {
 export class BlobStore {
   private readonly blobsDir: string;
   private readonly tmpDir: string;
+  private readonly partsDir: string;
   usedBytes = 0;
   blobCount = 0;
+  /** bytes held by multipart parts that are not composed yet */
+  partsBytes = 0;
 
   constructor(
     root: string,
@@ -46,11 +49,13 @@ export class BlobStore {
   ) {
     this.blobsDir = path.join(path.resolve(root), 'blobs');
     this.tmpDir = path.join(path.resolve(root), 'tmp');
+    this.partsDir = path.join(path.resolve(root), 'parts');
   }
 
   async init(): Promise<void> {
     await mkdir(this.blobsDir, { recursive: true });
     await mkdir(this.tmpDir, { recursive: true });
+    await mkdir(this.partsDir, { recursive: true });
     await this.cleanStaleTmp();
     await this.scan();
   }
@@ -82,7 +87,7 @@ export class BlobStore {
   }
 
   hasCapacityFor(bytes: number): boolean {
-    return this.usedBytes + bytes <= this.capacityBytes;
+    return this.usedBytes + this.partsBytes + bytes <= this.capacityBytes;
   }
 
   async stage(blobId: string, body: Readable): Promise<StagedBlob> {
@@ -174,6 +179,89 @@ export class BlobStore {
     return { ok: true, sha256: hash.digest('hex'), size };
   }
 
+  // ------------------------------------------------------------------------- multipart parts
+  //   <root>/parts/<uploadId>/<partNo>   one file per part; composed into a normal blob on complete
+
+  private partDir(uploadId: string): string {
+    return path.join(this.partsDir, BlobStore.assertBlobId(uploadId));
+  }
+
+  static assertPartNo(n: string | number): number {
+    const v = Number(n);
+    if (!Number.isInteger(v) || v < 1 || v > 10_000) throw new BlobError(400, 'Invalid part number');
+    return v;
+  }
+
+  /** Store one part (re-uploading a part number replaces it). Written to tmp and renamed. */
+  async putPart(uploadId: string, partNo: number, body: Readable): Promise<{ size: number; sha256: string }> {
+    const dir = this.partDir(uploadId);
+    await mkdir(dir, { recursive: true });
+    const n = BlobStore.assertPartNo(partNo);
+    const staged = await this.stage(uploadId, body); // same hashing + fsync path as blobs
+    const file = path.join(dir, String(n));
+    const old = await stat(file).catch(() => null);
+    await rename(this.tmpPath(uploadId, staged.stagedToken), file);
+    this.partsBytes += staged.size - (old?.size ?? 0);
+    return { size: staged.size, sha256: staged.sha256 };
+  }
+
+  async listParts(uploadId: string): Promise<number[]> {
+    const names = await readdir(this.partDir(uploadId)).catch(() => [] as string[]);
+    return names.map(Number).filter((n) => Number.isInteger(n)).sort((a, b) => a - b);
+  }
+
+  /**
+   * Concatenate parts (in the given order) into a committed blob, hashing as it goes. The blob only
+   * appears (atomic rename) once every byte is on disk and fsynced; the parts are then removed.
+   */
+  async compose(uploadId: string, blobId: string, parts: number[]): Promise<{ size: number; sha256: string; path: string }> {
+    const dir = this.partDir(uploadId);
+    const have = new Set(await this.listParts(uploadId));
+    const missing = parts.filter((p) => !have.has(p));
+    if (missing.length) throw new BlobError(409, `missing parts: ${missing.join(',')}`);
+
+    const token = randomBytes(18).toString('base64url');
+    const tmp = this.tmpPath(blobId, token);
+    const hash = createHash('sha256');
+    let size = 0;
+    const out = createWriteStream(tmp, { flags: 'wx' });
+    try {
+      for (const p of parts) {
+        for await (const chunk of createReadStream(path.join(dir, String(p)))) {
+          const buf = chunk as Buffer;
+          hash.update(buf);
+          size += buf.length;
+          if (!out.write(buf)) await new Promise<void>((r) => out.once('drain', () => r()));
+        }
+      }
+      await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
+      const fh = await open(tmp, 'r');
+      try {
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    } catch (err) {
+      out.destroy();
+      await unlink(tmp).catch(() => undefined);
+      throw err;
+    }
+    const committed = await this.commit(blobId, token);
+    await this.deleteParts(uploadId);
+    return { size: committed.size, sha256: hash.digest('hex'), path: committed.path };
+  }
+
+  async deleteParts(uploadId: string): Promise<void> {
+    const dir = this.partDir(uploadId);
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      const f = path.join(dir, name);
+      const s = await stat(f).catch(() => null);
+      await unlink(f).catch(() => undefined);
+      if (s) this.partsBytes = Math.max(0, this.partsBytes - s.size);
+    }
+    await rmdir(dir).catch(() => undefined);
+  }
+
   async delete(blobId: string): Promise<boolean> {
     const file = this.blobPath(blobId);
     try {
@@ -214,9 +302,16 @@ export class BlobStore {
     this.blobCount = count;
   }
 
-  /** Remove abandoned staged files (e.g. client disconnected, node crashed mid-upload). */
+  /** Remove abandoned staged files and multipart uploads nobody completed within 48 h. */
   async cleanStaleTmp(): Promise<number> {
     let removed = 0;
+    for (const id of await readdir(this.partsDir).catch(() => [] as string[])) {
+      const s = await stat(path.join(this.partsDir, id)).catch(() => null);
+      if (s && Date.now() - s.mtimeMs > 48 * STALE_TMP_MS) {
+        await this.deleteParts(id).catch(() => undefined);
+        removed++;
+      }
+    }
     for (const name of await readdir(this.tmpDir)) {
       const file = path.join(this.tmpDir, name);
       const s = await stat(file).catch(() => null);

@@ -39,7 +39,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // Request latency feeds the risk score. Streaming a 50 MB blob takes long because it is big, not
   // because the node is slow, so only small transfers count as latency samples (all count as errors).
   app.addHook('onResponse', async (req, reply) => {
-    if (!req.url.startsWith('/internal/blobs')) return;
+    if (!req.url.startsWith('/internal/blobs') && !req.url.startsWith('/internal/parts')) return;
     const bytes = Number(req.headers['x-expected-size'] ?? req.headers['content-length'] ?? reply.getHeader('content-length') ?? 0);
     metrics.record(bytes <= 1024 * 1024 ? reply.elapsedTime : null, reply.statusCode >= 500);
   });
@@ -104,6 +104,30 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     const info = await store.head(req.params.blobId);
     if (!info) return reply.code(404).send({ error: 'blob not found' });
     return store.verify(req.params.blobId);
+  });
+
+  // ----------------------------------------------------------------------------- multipart
+  type PartParams = { Params: { uploadId: string; partNo: string } };
+  app.put<PartParams>('/internal/parts/:uploadId/:partNo', async (req, reply) => {
+    const len = Number(req.headers['x-expected-size'] ?? req.headers['content-length']);
+    if (Number.isFinite(len) && !store.hasCapacityFor(len)) return reply.code(507).send({ error: 'insufficient storage' });
+    const body = req.body as unknown as import('node:stream').Readable;
+    if (!body || typeof body.pipe !== 'function') return reply.code(400).send({ error: 'expected a streamed request body' });
+    const part = await store.putPart(req.params.uploadId, BlobStore.assertPartNo(req.params.partNo), body);
+    return { ...part, stagedToken: 'part' };
+  });
+
+  app.get<{ Params: { uploadId: string } }>('/internal/parts/:uploadId', async (req) => ({ parts: await store.listParts(req.params.uploadId) }));
+
+  app.post<{ Params: { uploadId: string }; Body: { blobId?: string; parts?: number[] } }>('/internal/parts/:uploadId/compose', async (req) => {
+    const { blobId, parts } = (req.body ?? {}) as { blobId?: string; parts?: number[] };
+    if (!blobId || !Array.isArray(parts) || parts.length === 0) throw new BlobError(400, 'blobId and parts required');
+    return store.compose(req.params.uploadId, BlobStore.assertBlobId(blobId), parts.map((p) => BlobStore.assertPartNo(p)));
+  });
+
+  app.delete<{ Params: { uploadId: string } }>('/internal/parts/:uploadId', async (req) => {
+    await store.deleteParts(req.params.uploadId);
+    return { ok: true };
   });
 
   app.delete<BlobParams>('/internal/blobs/:blobId', async (req) => ({
