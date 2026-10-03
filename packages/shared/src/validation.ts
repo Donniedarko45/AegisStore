@@ -17,6 +17,9 @@ export const registerSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
 });
 export const loginSchema = z.object({ email: emailSchema, password: z.string().min(1).max(200) });
+export const changePasswordSchema = z
+  .object({ currentPassword: z.string().min(1).max(200), newPassword: passwordSchema })
+  .refine((v) => v.currentPassword !== v.newPassword, { message: 'New password must differ from the current one', path: ['newPassword'] });
 
 export const createBucketSchema = z.object({
   name: bucketNameSchema,

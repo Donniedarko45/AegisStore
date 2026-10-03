@@ -21,17 +21,17 @@ interface Point {
  *   nodes that are eligible.
  */
 export class HashRing {
-  private readonly points: Point[] = [];
+  private readonly points_: Point[] = [];
   private readonly nodeIds: string[];
 
   constructor(nodeIds: string[], public readonly vnodes = 128) {
     this.nodeIds = [...new Set(nodeIds)];
     for (const node of this.nodeIds) {
       for (let i = 0; i < vnodes; i++) {
-        this.points.push({ pos: ringHash(`${node}#${i}`), node });
+        this.points_.push({ pos: ringHash(`${node}#${i}`), node });
       }
     }
-    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1));
+    this.points_.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1));
   }
 
   get size(): number {
@@ -41,33 +41,43 @@ export class HashRing {
   /** Index of the first point at or after `pos` (wraps to 0). */
   private lowerBound(pos: number): number {
     let lo = 0;
-    let hi = this.points.length;
+    let hi = this.points_.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.points[mid]!.pos < pos) lo = mid + 1;
+      if (this.points_[mid]!.pos < pos) lo = mid + 1;
       else hi = mid;
     }
-    return lo === this.points.length ? 0 : lo;
+    return lo === this.points_.length ? 0 : lo;
   }
 
   getNodes(key: string, count: number, isEligible: (nodeId: string) => boolean = () => true): string[] {
-    if (this.points.length === 0 || count <= 0) return [];
+    if (this.points_.length === 0 || count <= 0) return [];
     const picked: string[] = [];
     const start = this.lowerBound(ringHash(key));
-    for (let step = 0; step < this.points.length && picked.length < count; step++) {
-      const { node } = this.points[(start + step) % this.points.length]!;
+    for (let step = 0; step < this.points_.length && picked.length < count; step++) {
+      const { node } = this.points_[(start + step) % this.points_.length]!;
       if (!picked.includes(node) && isEligible(node)) picked.push(node);
     }
     return picked;
   }
 
+  /** All virtual-node positions as fractions of the ring (0..1), sorted clockwise. */
+  points(): { pos: number; node: string }[] {
+    return this.points_.map((p) => ({ pos: p.pos / RING_SIZE, node: p.node }));
+  }
+
+  /** Where a key lands on the ring, as a fraction (0..1). */
+  static position(key: string): number {
+    return ringHash(key) / RING_SIZE;
+  }
+
   /** Fraction (0..1) of the ring each node owns as primary. */
   shares(): Map<string, number> {
     const result = new Map<string, number>(this.nodeIds.map((n) => [n, 0]));
-    const n = this.points.length;
+    const n = this.points_.length;
     for (let i = 0; i < n; i++) {
-      const cur = this.points[i]!;
-      const prev = this.points[(i - 1 + n) % n]!;
+      const cur = this.points_[i]!;
+      const prev = this.points_[(i - 1 + n) % n]!;
       const arc = i === 0 ? cur.pos + (RING_SIZE - prev.pos) : cur.pos - prev.pos;
       result.set(cur.node, (result.get(cur.node) ?? 0) + arc / RING_SIZE);
     }

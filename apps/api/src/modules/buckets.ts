@@ -141,7 +141,9 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
   });
 
   app.delete<{ Params: { bucket: string } }>('/api/buckets/:bucket', async (req) => {
-    const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'ADMIN');
+    const { bucket, access } = await requireBucket(ctx, req, req.params.bucket, 'ADMIN');
+    // an ADMIN *grant* manages the bucket, but only its owner (or a site admin) may destroy it
+    if (access.via !== 'owner' && access.via !== 'admin') throw AppError.forbidden('Only the bucket owner can delete it');
     const [live] = rowsOf<{ n: number }>(
       await ctx.db.execute(sql`
         SELECT count(*)::int AS n
@@ -151,8 +153,16 @@ export function bucketRoutes(app: FastifyInstance, ctx: AppContext) {
     if ((live?.n ?? 0) > 0) {
       throw new AppError(409, 'BUCKET_NOT_EMPTY', `Bucket still contains ${live!.n} object(s). Delete them first.`);
     }
-    // soft delete: retained (deleted) versions keep their blobs until the retention purge
-    await ctx.db.update(buckets).set({ deletedAt: new Date() }).where(and(eq(buckets.id, bucket.id), isNull(buckets.deletedAt)));
+    // Soft delete. Anything still stored (non-current versions, delete markers) is scheduled for the
+    // retention purge so a deleted bucket can never leak blobs.
+    const purgeAfter = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
+    await ctx.db.transaction(async (tx) => {
+      await tx.update(buckets).set({ deletedAt: new Date() }).where(and(eq(buckets.id, bucket.id), isNull(buckets.deletedAt)));
+      await tx.execute(sql`
+        UPDATE object_versions v SET state = 'DELETED', deleted_at = now(), purge_after = ${purgeAfter}
+          FROM objects o
+         WHERE v.object_id = o.id AND o.bucket_id = ${bucket.id} AND v.state = 'ACTIVE'`);
+    });
     await audit(ctx, req, { action: 'bucket.delete', resourceType: 'bucket', resourceId: bucket.id, metadata: { name: bucket.name } });
     return { ok: true };
   });

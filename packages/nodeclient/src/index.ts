@@ -137,8 +137,19 @@ export class StorageClient {
     return this.json(node, `/internal/blobs/${blobId}/stage/${stagedToken}`, { method: 'DELETE' }).catch(() => undefined);
   }
 
+  /** Best effort: never throws (used for cleanup after failed writes). */
   deleteBlob(node: NodeRef, blobId: string) {
     return this.json(node, `/internal/blobs/${blobId}`, { method: 'DELETE' }).catch(() => undefined);
+  }
+
+  /** True only when the node confirmed the blob is gone (deleted now or already absent). */
+  async tryDeleteBlob(node: NodeRef, blobId: string): Promise<boolean> {
+    try {
+      await this.json(node, `/internal/blobs/${blobId}`, { method: 'DELETE' });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   verify(node: NodeRef, blobId: string) {

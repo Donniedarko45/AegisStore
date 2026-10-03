@@ -34,6 +34,13 @@ export async function runGc(db: Db, storage: StorageClient, log: Logger, metrics
   const n = (removed as unknown as { rows: unknown[] }).rows.length;
   if (n) log.info({ count: n }, 'removed abandoned pending uploads');
 
+  // object rows whose every upload failed before producing a version (no history, no current)
+  await db.execute(sql`
+    DELETE FROM objects o
+     WHERE o.current_version_id IS NULL
+       AND o.updated_at < now() - interval '1 hour'
+       AND NOT EXISTS (SELECT 1 FROM object_versions v WHERE v.object_id = o.id)`);
+
   await db.execute(sql`DELETE FROM sessions WHERE expires_at < now()`);
   await db.execute(sql`DELETE FROM node_metrics WHERE ts < now() - make_interval(days => ${metricsRetentionDays})`);
 }

@@ -16,7 +16,8 @@ import { requireBucket, type BucketRow } from '../core/access';
 import { audit } from '../core/audit';
 import { fanoutStage } from '../core/fanout';
 import { iso, parse, rowsOf } from '../core/http';
-import { pickNodes, type NodeRow } from '../core/placement';
+import { HashRing } from '@aegis/hashring';
+import { pickNodes, ringFor, type NodeRow } from '../core/placement';
 import { publishEvent } from '../core/redis';
 import type { StagedResult } from '@aegis/nodeclient';
 import { requireUser } from '../plugins/auth';
@@ -168,6 +169,114 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
     return { ok: true };
   });
 
+  // --------------------------------------------------------------------------------- restore
+  // Makes an older version current again by creating a NEW version that shares the old blob (no
+  // byte copy). The source may be an ACTIVE non-current version or a DELETED one still inside the
+  // retention window, which makes this "undo delete" for unversioned buckets too.
+  app.post<{ Params: { bucket: string }; Querystring: Q }>('/api/buckets/:bucket/object/restore', async (req) => {
+    const principal = requireUser(req);
+    const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'WRITE');
+    const key = keyFrom(req.query);
+    if (!req.query.versionId) throw AppError.validation('versionId is required');
+    const obj = await findObject(ctx, bucket.id, key);
+    if (!obj) throw AppError.notFound('Object not found');
+
+    const [source] = await ctx.db
+      .select()
+      .from(objectVersions)
+      .where(and(eq(objectVersions.id, req.query.versionId), eq(objectVersions.objectId, obj.id)));
+    if (!source || source.isDeleteMarker || !source.blobId || (source.state !== 'ACTIVE' && source.state !== 'DELETED')) {
+      throw AppError.notFound('Version not found or no longer restorable');
+    }
+    if (source.id === obj.currentVersionId) throw AppError.conflict('This version is already current');
+
+    const healthy = await ctx.db
+      .select()
+      .from(replicas)
+      .where(and(eq(replicas.versionId, source.id), eq(replicas.state, 'HEALTHY')));
+    if (healthy.length === 0) throw new AppError(409, 'STORAGE_UNAVAILABLE', 'No healthy replica of that version remains');
+
+    const purgeAfter = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
+    const restored = await ctx.db.transaction(async (tx) => {
+      const [locked] = await tx.select().from(objects).where(eq(objects.id, obj.id)).for('update');
+      const [{ n } = { n: 0 }] = await tx
+        .select({ n: sql<number>`coalesce(max(${objectVersions.versionNo}), 0)::int` })
+        .from(objectVersions)
+        .where(eq(objectVersions.objectId, obj.id));
+      const [created] = await tx
+        .insert(objectVersions)
+        .values({
+          objectId: obj.id,
+          versionNo: n + 1,
+          size: source.size,
+          contentType: source.contentType,
+          sha256: source.sha256,
+          blobId: source.blobId,
+          state: 'ACTIVE',
+          storageClass: source.storageClass,
+          targetReplicas: source.targetReplicas,
+          createdBy: principal.user.id,
+        })
+        .returning();
+      await tx.insert(replicas).values(
+        healthy.map((r) => ({ versionId: created!.id, nodeId: r.nodeId, blobPath: r.blobPath, sha256: r.sha256, state: 'HEALTHY' as const, lastVerifiedAt: r.lastVerifiedAt })),
+      );
+      if (locked?.currentVersionId && !bucket.versioningEnabled) {
+        await tx
+          .update(objectVersions)
+          .set({ state: 'DELETED', deletedAt: new Date(), purgeAfter })
+          .where(and(eq(objectVersions.id, locked.currentVersionId), eq(objectVersions.state, 'ACTIVE')));
+      }
+      await tx.update(objects).set({ currentVersionId: created!.id, updatedAt: new Date() }).where(eq(objects.id, obj.id));
+      return created!;
+    });
+
+    await audit(ctx, req, {
+      action: 'object.restore',
+      resourceType: 'object',
+      resourceId: obj.id,
+      metadata: { bucket: bucket.name, key, fromVersionNo: source.versionNo, fromState: source.state, newVersionNo: restored.versionNo },
+    });
+    void publishEvent(ctx.redis, 'object.created', { bucket: bucket.name, key, restored: true });
+    return { ok: true, versionId: restored.id, versionNo: restored.versionNo };
+  });
+
+  // ------------------------------------------------------------------------- recently deleted
+  // Objects with no current version whose latest real version still exists: DELETED (unversioned
+  // bucket, restorable until purge_after) or ACTIVE behind a delete marker (versioned bucket).
+  app.get<{ Params: { bucket: string } }>('/api/buckets/:bucket/objects/deleted', async (req) => {
+    const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'READ');
+    const rows = rowsOf<{
+      key: string; version_id: string; version_no: number; size: number; content_type: string; sha256: string;
+      deleted_at: Date | null; purge_after: Date | null; updated_at: Date;
+    }>(
+      await ctx.db.execute(sql`
+        SELECT o.key, v.id AS version_id, v.version_no, v.size, v.content_type, v.sha256, v.deleted_at, v.purge_after,
+               o.updated_at
+          FROM ${objects} o
+          JOIN LATERAL (
+            SELECT * FROM ${objectVersions} x
+             WHERE x.object_id = o.id AND x.is_delete_marker = false AND x.state IN ('ACTIVE', 'DELETED')
+             ORDER BY x.version_no DESC LIMIT 1
+          ) v ON true
+         WHERE o.bucket_id = ${bucket.id} AND o.current_version_id IS NULL
+         ORDER BY coalesce(v.deleted_at, o.updated_at) DESC
+         LIMIT 500`),
+    );
+    return {
+      items: rows.map((r) => ({
+        key: r.key,
+        versionId: r.version_id,
+        versionNo: r.version_no,
+        size: Number(r.size),
+        contentType: r.content_type,
+        sha256: r.sha256,
+        deletedAt: iso(r.deleted_at ?? r.updated_at),
+        purgeAfter: iso(r.purge_after),
+      })),
+    };
+  });
+
   // -------------------------------------------------------------------------------- listing
   app.get<{ Params: { bucket: string } }>('/api/buckets/:bucket/objects', async (req) => {
     const { bucket } = await requireBucket(ctx, req, req.params.bucket, 'READ');
@@ -269,9 +378,23 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
       integrity = integrityOf(available, current.targetReplicas);
     }
 
+    let placement: { key: string; ringPos: number; ringOrder: string[] } | null = null;
+    if (current) {
+      const placementKey = `${bucket.id}/${key}@${current.id}`;
+      const all = await ctx.db.select().from(storageNodes);
+      const names = new Map(all.map((n) => [n.id, n.name]));
+      placement = {
+        key: placementKey,
+        ringPos: HashRing.position(placementKey),
+        // clockwise order of distinct nodes from the key (what placement would pick if all were healthy)
+        ringOrder: ringFor(all, ctx.cfg.VNODES_PER_NODE).getNodes(placementKey, all.length).map((id) => names.get(id) ?? id),
+      };
+    }
+
     return {
       key,
       bucket: bucket.name,
+      placement,
       current: current && {
         versionId: current.id,
         versionNo: current.versionNo,
@@ -294,6 +417,8 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
         isCurrent: v.id === obj.currentVersionId,
         isProtected: v.isProtected,
         createdAt: iso(v.createdAt),
+        deletedAt: iso(v.deletedAt),
+        purgeAfter: iso(v.purgeAfter),
         createdBy: createdByEmail,
       })),
     };
@@ -480,6 +605,9 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
 // =============================================================================================
 const STATUS_RANK: Record<string, number> = { HEALTHY: 0, WARNING: 1, HIGH_RISK: 2, DRAINING: 3, OFFLINE: 4 };
 
+/** downloads currently held in memory for verify-before-send (capped to bound API memory) */
+let bufferedInFlight = 0;
+
 async function flagReplica(
   ctx: AppContext,
   req: FastifyRequest,
@@ -513,9 +641,10 @@ async function serveObject(
     .innerJoin(storageNodes, eq(storageNodes.id, replicas.nodeId))
     .where(and(eq(replicas.versionId, version.id), eq(replicas.state, 'HEALTHY')));
 
-  // healthiest nodes first; shuffle within a tier so reads spread across equally good replicas
+  // Healthiest nodes first; shuffle within a tier so reads spread across equally good replicas.
+  // Replicas on OFFLINE-marked nodes are kept as a last resort: the status may be stale (e.g. the
+  // worker is lagging) and trying costs nothing when every better option has already failed.
   const ordered = candidates
-    .filter((c) => c.node.status !== 'OFFLINE')
     .map((c) => ({ ...c, jitter: Math.random() }))
     .sort((a, b) => (STATUS_RANK[a.node.status]! - STATUS_RANK[b.node.status]!) || a.jitter - b.jitter);
 
@@ -545,7 +674,9 @@ async function serveObject(
 
     // Small objects are fully verified BEFORE the first byte is sent, so a corrupt replica
     // is never exposed to the client and we can transparently fall back.
-    if (version.size <= ctx.cfg.VERIFY_BUFFER_MAX_BYTES) {
+    const buffered = version.size <= ctx.cfg.VERIFY_BUFFER_MAX_BYTES && bufferedInFlight < ctx.cfg.VERIFY_BUFFER_CONCURRENCY;
+    if (buffered) {
+      bufferedInFlight++;
       try {
         const chunks: Buffer[] = [];
         for await (const c of blob.stream) chunks.push(c as Buffer);
@@ -557,15 +688,17 @@ async function serveObject(
           reply.removeHeader('x-aegis-served-by');
           continue;
         }
-        await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, versionId: version.id, servedBy: node.name, fallbacks: attempts.length } });
+        await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, fallbacks: attempts.length } });
         return reply.header('x-aegis-integrity', 'verified').send(body);
       } catch (err) {
         attempts.push(`${node.name}: ${(err as Error).message}`);
         continue;
+      } finally {
+        bufferedInFlight--;
       }
     }
 
-    // Large objects stream through a verifier; on a final mismatch the response is aborted
+    // Large objects (or small ones while the buffer budget is used up) stream through a verifier; on a final mismatch the response is aborted
     // (the client sees a truncated transfer and the checksum is never reported as verified).
     const hash = createHash('sha256');
     const verifier = new Transform({
@@ -580,7 +713,7 @@ async function serveObject(
         cb(new Error('checksum mismatch'));
       },
     });
-    await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, versionId: version.id, servedBy: node.name, streamed: true } });
+    await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, streamed: true } });
     return reply.header('x-aegis-integrity', 'streaming').send(pipeline(blob.stream, verifier, () => undefined));
   }
 

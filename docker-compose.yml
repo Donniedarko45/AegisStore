@@ -94,6 +94,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       api: { condition: service_healthy } # the api applies database migrations on boot
+    healthcheck:
+      # the worker touches this file every 5s; a stale file means the event loop is stuck
+      test: ["CMD", "node", "-e", "const s=require('fs').statSync('/tmp/aegis-worker-alive');process.exit(Date.now()-s.mtimeMs<30000?0:1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
 
   storage-node-1:
     <<: *service
