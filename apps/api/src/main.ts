@@ -4,7 +4,7 @@ import { ensureAdmin } from './bootstrap';
 import { loadConfig } from './config';
 import type { AppContext } from './context';
 import { createRedis } from './core/redis';
-import { StorageClient } from './core/storageclient';
+import { StorageClient } from '@aegis/nodeclient';
 import { buildApp } from './server';
 
 const cfg = loadConfig();

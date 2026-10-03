@@ -18,6 +18,10 @@ const schema = z.object({
   VERIFY_BUFFER_MAX_BYTES: envInt(DEFAULTS.verifyBufferMaxBytes),
   RETENTION_HOURS: envInt(DEFAULTS.retentionHours),
   SESSION_TTL_DAYS: envInt(7),
+  /** per source IP per hour */
+  REGISTER_RATE_LIMIT: envInt(10),
+  /** per source IP + email per 15 minutes */
+  LOGIN_RATE_LIMIT: envInt(10),
   COOKIE_SECURE: envBool(false),
   ALLOWED_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),

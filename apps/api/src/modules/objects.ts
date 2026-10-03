@@ -18,7 +18,7 @@ import { fanoutStage } from '../core/fanout';
 import { iso, parse, rowsOf } from '../core/http';
 import { pickNodes, type NodeRow } from '../core/placement';
 import { publishEvent } from '../core/redis';
-import type { StagedResult } from '../core/storageclient';
+import type { StagedResult } from '@aegis/nodeclient';
 import { requireUser } from '../plugins/auth';
 
 type Q = { key?: string; versionId?: string };

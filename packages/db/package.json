@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "generate": "drizzle-kit generate",
     "migrate": "tsx src/migrate-cli.ts",
-    "test": "echo 'no unit tests in @aegis/db'"
+    "test": "vitest run"
   },
   "dependencies": {
     "@aegis/shared": "workspace:*",

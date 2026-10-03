@@ -16,7 +16,15 @@ export function rowsOf<T>(res: unknown): T[] {
   return (res as { rows: T[] }).rows;
 }
 
-export const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
+/**
+ * Dates from the ORM are Date objects, but raw `db.execute()` rows carry Postgres timestamp
+ * strings ("2026-10-03 08:41:07.12+00"), which V8 parses correctly. Accept both.
+ */
+export const iso = (d: Date | string | null | undefined): string | null => {
+  if (!d) return null;
+  const date = d instanceof Date ? d : new Date(d);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
 
 export function isUniqueViolation(err: unknown): boolean {
   const e = err as { code?: string; cause?: { code?: string } };

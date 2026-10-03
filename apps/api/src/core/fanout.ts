@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import { AppError } from '@aegis/shared';
-import type { StageSink } from './storageclient';
+import type { StageSink } from '@aegis/nodeclient';
 
 /**
  * Stream one source to every sink in a single pass while computing SHA-256 and size.

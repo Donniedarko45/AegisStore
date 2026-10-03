@@ -38,7 +38,7 @@ function setSessionCookie(ctx: AppContext, reply: FastifyReply, token: string, e
 
 export function authRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/auth/register', async (req, reply) => {
-    if (!(await rateLimit(ctx.redis, `register:${req.ip}`, 10, 3600))) {
+    if (!(await rateLimit(ctx.redis, `register:${req.ip}`, ctx.cfg.REGISTER_RATE_LIMIT, 3600))) {
       throw new AppError(429, 'RATE_LIMITED', 'Too many registrations from this address');
     }
     const body = parse(registerSchema, req.body);
@@ -66,7 +66,7 @@ export function authRoutes(app: FastifyInstance, ctx: AppContext) {
 
   app.post('/api/auth/login', async (req, reply) => {
     const body = parse(loginSchema, req.body);
-    if (!(await rateLimit(ctx.redis, `login:${req.ip}:${body.email}`, 10, 900))) {
+    if (!(await rateLimit(ctx.redis, `login:${req.ip}:${body.email}`, ctx.cfg.LOGIN_RATE_LIMIT, 900))) {
       throw new AppError(429, 'RATE_LIMITED', 'Too many login attempts, try again in a few minutes');
     }
     const [user] = await ctx.db.select().from(users).where(eq(users.email, body.email));
