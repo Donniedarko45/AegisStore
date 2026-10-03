@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+*.log
+runtime/*
+!runtime/.gitkeep
+.DS_Store
+coverage
+.vite

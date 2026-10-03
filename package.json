@@ -1,0 +1,21 @@
+{
+  "name": "aegisstore",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.28.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "pnpm -r --workspace-concurrency=1 test",
+    "db:generate": "pnpm --filter @aegis/db generate",
+    "db:migrate": "pnpm --filter @aegis/db migrate",
+    "dev:stack": "node scripts/dev-stack.mjs",
+    "verify:e2e": "node scripts/verify-e2e.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "vitest": "^3.2.0"
+  }
+}
