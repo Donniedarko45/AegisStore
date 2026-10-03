@@ -95,13 +95,15 @@ async function userFromSession(ctx: AppContext, token: string): Promise<Principa
   return { kind: 'USER', user: row.user, cap: 'ADMIN', viaCookie: true };
 }
 
-/** Cookie-authenticated, state-changing requests must come from our own origin (CSRF defence). */
-function originAllowed(ctx: AppContext, req: FastifyRequest): boolean {
-  const origin = req.headers.origin;
-  if (!origin) return true; // non-browser clients (curl, scripts) send no Origin
+/**
+ * CSRF defence for cookie-authenticated, state-changing requests: a browser always sends Origin on
+ * those, and it must match the host the user actually visited (or an explicitly allowed origin).
+ * Requests without Origin come from non-browser clients (curl, scripts) and cannot ride a cookie.
+ */
+export function isAllowedOrigin(origin: string | undefined, host: string | undefined, allowed: string[]): boolean {
+  if (!origin) return true;
   try {
-    const host = new URL(origin).host;
-    return host === req.headers.host || ctx.cfg.allowedOrigins.includes(origin);
+    return new URL(origin).host === host || allowed.includes(origin);
   } catch {
     return false;
   }
@@ -125,7 +127,8 @@ export function registerAuth(app: FastifyInstance, ctx: AppContext) {
     if (cookie) {
       const principal = await userFromSession(ctx, cookie);
       if (principal) {
-        if (UNSAFE.has(req.method) && !originAllowed(ctx, req)) {
+        // req.host honours X-Forwarded-Host (trustProxy), so this works behind nginx / the Vite dev proxy
+        if (UNSAFE.has(req.method) && !isAllowedOrigin(req.headers.origin, req.host, ctx.cfg.allowedOrigins)) {
           throw AppError.forbidden('Cross-origin request blocked');
         }
         req.principal = principal;
