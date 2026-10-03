@@ -53,13 +53,13 @@ docker compose start storage-node-2    # back to HEALTHY after 3 heartbeats
 
 The physical blobs are visible on the host under `runtime/storage-node-N/blobs/<2 chars>/<blob-id>`.
 
-Run the whole demo automatically (81 checks):
+Run the whole demo automatically (115 checks):
 
 ```bash
 API_URL=http://localhost:8080 node scripts/verify-e2e.mjs
 ```
 
-## What works today (Batch 1)
+## What works today
 
 | Area | Status |
 |---|---|
@@ -69,10 +69,31 @@ API_URL=http://localhost:8080 node scripts/verify-e2e.mjs
 | Consistent hash ring (128 vnodes/node), 2 replicas on distinct nodes, `503` if fewer than 2 healthy nodes | ✅ |
 | SHA-256 verified on upload (all replicas must match) and on download; bad replicas marked `CORRUPT` | ✅ |
 | Replica fallback on node failure; node `OFFLINE` after 15 s, back to `HEALTHY` after probation | ✅ |
-| Dashboard, node status and history, object details (replicas, versions) | ✅ |
+| Version restore (including undo-delete within retention), "recently deleted", reference-counted retention purge | ✅ |
+| Live updates over SSE: node heartbeats stream into charts, data changes refresh pages without polling | ✅ |
+| Analytics: requests, bandwidth, storage growth, content types, size bands, top downloads, per-node latency/CPU/disk I/O | ✅ |
+| Interactive hash-ring explorer (place any key, simulate node failures), live cluster topology, status-page uptime | ✅ |
+| Password change, session list with per-device sign-out, admin user management (roles, disable/enable) | ✅ |
 | Permissions: owner, READ/WRITE/ADMIN grants (API + UI), public-read, enforced server-side | ✅ |
 | Tamper-evident (hash-chained) audit log with search and verification | ✅ |
-| Version restore, retention purge, multipart, signed URLs, risk scoring, self-healing, HOT/WARM/COLD, adaptive replication, ransomware detection, simulation lab, analytics, live updates (SSE) | ⏳ Batch 2 (see roadmap in the architecture doc) |
+| Multipart, signed URLs, risk scoring, self-healing, HOT/WARM/COLD, adaptive replication, ransomware detection, simulation lab | ⏳ next phases (see the roadmap in the architecture doc) |
+
+### The interface
+
+A Vercel-style dashboard built on [base-ui](https://base-ui.com), [Sonner](https://sonner.emilkowal.ski), [cmdk](https://cmdk.paco.me), [NumberFlow](https://number-flow.barvian.me), [recharts](https://recharts.org) and [Liveline](https://github.com/benjitaylor/liveline). Motion follows Emil Kowalski's design-engineering rules:
+
+- **Curves:** three easing curves only (`--ease-out`, `--ease-in-out`, `--ease-drawer`).
+- **Properties:** only transform and opacity are animated.
+- **Keyboard actions:** none are animated (the ⌘K menu opens instantly).
+- **Reduced motion:** honoured everywhere.
+
+Charts follow a validated colour-blind-safe palette, and every chart has a table view. Press **⌘K / Ctrl+K** anywhere.
+
+Fill a fresh stack with demo data:
+
+```bash
+API_URL=http://localhost:8080 node scripts/seed-demo.mjs
+```
 
 ## Development
 
@@ -81,7 +102,7 @@ Requirements: Node 22 and pnpm 10 (`corepack enable`).
 ```bash
 pnpm install
 pnpm typecheck
-pnpm test                         # unit tests (hash ring, storage node, permissions, validation, audit)
+pnpm test                         # unit tests (hash ring, storage node, permissions, validation, audit, CSRF)
 ```
 
 Run everything as local processes, with no Docker. You need PostgreSQL and Redis running; the defaults are `postgres://aegis@localhost:5433/aegis` and `redis://localhost:6380`, and you can override them with `DATABASE_URL` / `REDIS_URL`.

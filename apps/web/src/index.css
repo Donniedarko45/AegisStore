@@ -2,7 +2,7 @@
 @import '@fontsource-variable/geist-mono';
 @import 'tailwindcss';
 
-/* Theme is driven by next-themes' data-theme attribute (set before paint by /theme-init.js). */
+/* Theme is driven by the data-theme attribute (set before paint by /theme-init.js, then by lib/theme.ts). */
 @custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
 
 /* ------------------------------------------------------------------ tokens: light */

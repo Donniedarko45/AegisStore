@@ -1,6 +1,6 @@
 # AegisStore — System Architecture
 
-> Status: **v0.2: Batch 1 (Phases 1–5) implemented** · Date: 2026-10-03
+> Status: **v0.3: Phases 1–6 implemented, plus live updates (SSE), analytics and the production UI** · Date: 2026-10-03
 > Where the implementation differs from this design, see **§17 As built**.
 > Source: *AegisStore — Current User Manual (Batch 1, Phases 1–5)*
 > Scope: the **whole** system — Batch 1 foundation **and** the intelligent features still to build.
@@ -827,7 +827,7 @@ Work is staged so each phase ends with something runnable and demoable.
 
 | Phase | Deliverable |
 |---|---|
-| **6** Versioning complete + retention | Restore, download-by-version, delete markers, 24 h purge, grants UI |
+| **6** ✅ Versioning complete + retention | Restore, download-by-version, delete markers, 24 h purge, grants UI |
 | **7** Risk & health v2 | `node_metrics` history, risk scorer, WARNING/HIGH_RISK, explainability UI |
 | **8** Self-healing | Jobs table, reconciler, repair runner, drain, scrubber |
 | **9** Classification & adaptive replication | access stats, HOT/WARM/COLD, adjuster, load-aware reads |
@@ -951,3 +951,32 @@ Batch 1 (Phases 1–5) is implemented. `scripts/verify-e2e.mjs` runs 81 checks a
 7. 24 h retention.
 8. The default admin password is kept, with a warning at boot.
 9. httpOnly cookies.
+
+### 17.1 Second pass: audit fixes and additions (v0.3)
+
+A full backend audit found the following faults. Each is fixed and covered by a test, an e2e check or a manual reproduction:
+
+| Fault | Fix |
+|---|---|
+| Worker kept scheduling after its advisory-lock connection died, so two leaders were possible | Keepalive on the lock connection; on any failure the worker exits for a clean re-election |
+| Heartbeats were stamped with the API clock but compared with the DB clock | Heartbeat time and placement freshness both use the database `now()` |
+| Verify-before-send buffered up to 16 MB per download with no cap (OOM risk) | `VERIFY_BUFFER_CONCURRENCY` (default 8); beyond that, downloads stream-verify |
+| A stale OFFLINE status caused 503s even when a replica's node was actually up | OFFLINE-marked replicas are tried last instead of skipped |
+| `trustProxy: true` trusted the client's own `X-Forwarded-For`, so the login rate limit was bypassable | Trust only `TRUST_PROXY_HOPS` proxy hops, plus a per-IP cap against password spraying. Verified through nginx |
+| No way to change a password | Password change (revokes other sessions) and a session list with per-device sign-out |
+| An ADMIN grantee could delete someone else's bucket | Bucket deletion is owner or site-admin only; leftover versions are scheduled for purge |
+| Deleted data was never physically freed | Reference-counted retention purge in the worker (Phase 6) |
+| Failed first uploads left empty object rows; API-key prefix collisions surfaced as 500 | GC removes empty object rows; prefix collisions are retried |
+| Worker had no healthcheck | A liveness file is touched every 5 s and checked by Compose |
+| Idle nodes reported 0 ms latency (request latency only exists under traffic) | Every heartbeat runs a disk I/O probe (4 KB write, fsync and read); `node_metrics.probe_ms` |
+| A folder listing with a multi-byte prefix (emoji) cut keys at the wrong offset | The prefix length is measured by Postgres itself |
+
+**Additions:**
+
+- **Restore and purge:** version restore, a "recently deleted" view and the retention purge (Phase 6).
+- **Live updates:** an SSE event stream (Phase 12, early).
+- **New endpoints:** analytics, ring, uptime, node metric series and user administration.
+- **Folder listing:** S3-style delimiter listing.
+- **Interface:** a ground-up rebuild (see README).
+
+Dataviz decisions follow a validated palette: the categorical slots pass adjacent and all-pairs CVD checks in both themes, and status colours are reserved and always paired with an icon and label. There are no dual axes, and every chart has a table view.

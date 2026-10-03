@@ -1,5 +1,5 @@
 // Applies the saved theme before first paint (no flash). External file so the CSP needs no
-// 'unsafe-inline'. Mirrors next-themes' storage key and data-theme attribute.
+// 'unsafe-inline'. Shares its storage key with src/lib/theme.ts.
 (function () {
   try {
     var t = localStorage.getItem('theme') || 'system';

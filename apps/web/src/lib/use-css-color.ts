@@ -1,4 +1,4 @@
-import { useTheme } from 'next-themes';
+import { useTheme } from './theme';
 import { useEffect, useState } from 'react';
 
 /** Canvas charts (Liveline) cannot read CSS variables; resolve them per theme. */

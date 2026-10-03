@@ -2,7 +2,7 @@ import { Dialog } from '@base-ui/react/dialog';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Command } from 'cmdk';
 import { Activity, BarChart3, Database, HardDrive, KeyRound, LayoutDashboard, LogOut, Monitor, Moon, Plus, Search, Settings, Sun, Users } from 'lucide-react';
-import { useTheme } from 'next-themes';
+import { useTheme } from '../../lib/theme';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { create } from 'zustand';

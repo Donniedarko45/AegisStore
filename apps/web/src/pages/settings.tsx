@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { KeyRound, Laptop, Monitor, Moon, Plus, Server, ShieldCheck, Smartphone, Sun, Trash2, User } from 'lucide-react';
-import { useTheme } from 'next-themes';
+import { useTheme } from '../lib/theme';
 import { useState, type FormEvent } from 'react';
 import { NavLink, useParams } from 'react-router-dom';
 import { toast } from 'sonner';

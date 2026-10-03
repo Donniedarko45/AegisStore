@@ -1,7 +1,7 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Liveline } from 'liveline';
 import { Clock, Cpu, Gauge, HardDrive, MemoryStick, Network, Search } from 'lucide-react';
-import { useTheme } from 'next-themes';
+import { useTheme } from '../lib/theme';
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ChartCard, entityColor, Sparkline, TimeSeries, timeTick } from '../components/charts/chart-kit';

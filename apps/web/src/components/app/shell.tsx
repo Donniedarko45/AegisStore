@@ -1,6 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { KeyRound, LogOut, Monitor, Moon, Search, Settings, ShieldCheck, Sun } from 'lucide-react';
-import { useTheme } from 'next-themes';
+import { useTheme } from '../../lib/theme';
 import { Component, Suspense, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { Spinner } from '../ui/spinner';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
