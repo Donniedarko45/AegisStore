@@ -1,4 +1,7 @@
+import { randomBytes } from 'node:crypto';
+import { open, readFile, unlink } from 'node:fs/promises';
 import os from 'node:os';
+import path from 'node:path';
 import type { NodeMetrics } from '@aegis/shared';
 
 const WINDOW_MS = 60_000;
@@ -37,7 +40,27 @@ export class MetricsCollector {
     return total > 0 ? Math.max(0, Math.min(100, (1 - idle / total) * 100)) : 0;
   }
 
-  snapshot(disk: { usedBytes: number; capacityBytes: number; blobCount: number }): NodeMetrics {
+  /**
+   * Disk health probe: write 4 KB, fsync, read it back and delete it. Request latency only exists
+   * when there is traffic; the probe gives a real I/O latency signal even on an idle node.
+   */
+  async probe(dataDir: string): Promise<number> {
+    const file = path.join(dataDir, 'tmp', '.probe');
+    const t0 = performance.now();
+    try {
+      const fh = await open(file, 'w');
+      await fh.write(randomBytes(4096));
+      await fh.sync();
+      await fh.close();
+      await readFile(file);
+      await unlink(file);
+      return Math.round((performance.now() - t0) * 100) / 100;
+    } catch {
+      return -1; // reported as an error rather than a fake latency
+    }
+  }
+
+  snapshot(disk: { usedBytes: number; capacityBytes: number; blobCount: number }, probeMs?: number): NodeMetrics {
     const cutoff = Date.now() - WINDOW_MS;
     this.samples = this.samples.filter((s) => s.at >= cutoff);
     const times = this.samples.map((s) => s.ms).sort((a, b) => a - b);
@@ -55,6 +78,7 @@ export class MetricsCollector {
       errorRate: this.samples.length ? round(errors / this.samples.length, 4) : 0,
       blobCount: disk.blobCount,
       uptimeSec: Math.round(process.uptime()),
+      ...(probeMs !== undefined && probeMs >= 0 && { probeMs }),
     };
   }
 }

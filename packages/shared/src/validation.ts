@@ -47,6 +47,8 @@ export const listObjectsQuerySchema = z.object({
   q: z.string().max(200).optional(),
   integrity: z.enum(['HEALTHY', 'DEGRADED', 'UNAVAILABLE']).optional(),
   class: z.enum(['HOT', 'WARM', 'COLD']).optional(),
+  /** '/' groups keys into folders (S3 common prefixes) below `prefix` */
+  delimiter: z.literal('/').optional(),
   sort: z.enum(['key', 'size', 'createdAt']).default('createdAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
   page: z.coerce.number().int().min(1).default(1),
@@ -80,5 +82,6 @@ export const HeartbeatBodyGuard = z.object({
     errorRate: finite,
     blobCount: finite.int().nonnegative(),
     uptimeSec: finite,
+    probeMs: finite.nonnegative().optional(),
   }),
 });

@@ -1,102 +1,264 @@
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
 @import 'tailwindcss';
 
-/* Semantic tokens: components use bg-surface / text-muted etc. and never raw colours,
-   so light and dark themes (prefers-color-scheme) stay consistent. */
+/* Theme is driven by next-themes' data-theme attribute (set before paint by /theme-init.js). */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/* ------------------------------------------------------------------ tokens: light */
 :root {
-  --bg: #f6f7fb;
+  --bg: #fafafa;
   --surface: #ffffff;
-  --surface-2: #f1f3f9;
-  --border: #e3e6ef;
-  --text: #151a2c;
-  --muted: #6b7289;
-  --brand: #4f46e5;
-  --brand-hover: #4338ca;
-  --brand-soft: #eef0ff;
-  --ok: #059669;
-  --ok-soft: #e3f7ef;
-  --warn: #b45309;
-  --warn-soft: #fdf1dc;
-  --bad: #dc2626;
-  --bad-soft: #fde8e8;
-  --info: #0369a1;
-  --info-soft: #e0f1fb;
+  --surface-2: #f5f5f5;
+  --surface-3: #ebebeb;
+  --border: rgb(0 0 0 / 0.08);
+  --border-2: rgb(0 0 0 / 0.15);
+  --fg: #171717;
+  --fg-2: #5c5c5c;
+  --fg-3: #8f8f8f;
+  --accent: #171717;
+  --accent-hover: #383838;
+  --accent-fg: #ffffff;
+  --link: #0068d6;
+  --focus: rgb(0 112 243 / 0.45);
+
+  /* status (reserved: never used for series identity; always shipped with icon + label) */
+  --good: #0ca30c;
+  --good-text: #0b6b0b;
+  --good-soft: rgb(12 163 12 / 0.1);
+  --warn: #fab219;
+  --warn-text: #8a5a00;
+  --warn-soft: rgb(250 178 25 / 0.16);
+  --serious: #ec835a;
+  --bad: #d03b3b;
+  --bad-text: #b42323;
+  --bad-soft: rgb(208 59 59 / 0.1);
+  --info: #2a78d6;
+  --info-text: #1c5cab;
+  --info-soft: rgb(42 120 214 / 0.1);
+
+  /* categorical series (validated: adjacent + all-pairs for the first three) */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --grid: #ededed;
+  --axis: #d4d4d4;
+
+  --shadow-card: 0 0 0 1px var(--border), 0 1px 2px rgb(0 0 0 / 0.04);
+  --shadow-raised: 0 0 0 1px var(--border), 0 2px 4px -1px rgb(0 0 0 / 0.04), 0 6px 16px -4px rgb(0 0 0 / 0.08);
+  --shadow-popover: 0 0 0 1px var(--border), 0 4px 8px -2px rgb(0 0 0 / 0.06), 0 16px 40px -8px rgb(0 0 0 / 0.16);
   color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1020;
-    --surface: #151a2e;
-    --surface-2: #1c2240;
-    --border: #272e50;
-    --text: #e8ebf7;
-    --muted: #8f97b8;
-    --brand: #7c83ff;
-    --brand-hover: #9ba0ff;
-    --brand-soft: #232a57;
-    --ok: #34d399;
-    --ok-soft: #10302b;
-    --warn: #fbbf24;
-    --warn-soft: #3a2d12;
-    --bad: #f87171;
-    --bad-soft: #3b1a1f;
-    --info: #38bdf8;
-    --info-soft: #11303f;
-    color-scheme: dark;
-  }
+
+/* ------------------------------------------------------------------ tokens: dark */
+[data-theme='dark'] {
+  --bg: #000000;
+  --surface: #0a0a0a;
+  --surface-2: #161616;
+  --surface-3: #1f1f1f;
+  --border: rgb(255 255 255 / 0.09);
+  --border-2: rgb(255 255 255 / 0.17);
+  --fg: #ededed;
+  --fg-2: #a1a1a1;
+  --fg-3: #737373;
+  --accent: #ededed;
+  --accent-hover: #cccccc;
+  --accent-fg: #0a0a0a;
+  --link: #52a8ff;
+  --focus: rgb(82 168 255 / 0.5);
+
+  --good-text: #3fc23f;
+  --good-soft: rgb(12 163 12 / 0.16);
+  --warn-text: #f5b83d;
+  --warn-soft: rgb(250 178 25 / 0.14);
+  --bad-text: #f47171;
+  --bad-soft: rgb(208 59 59 / 0.2);
+  --info: #3987e5;
+  --info-text: #6aa8f0;
+  --info-soft: rgb(57 135 229 / 0.18);
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --grid: #1c1c1c;
+  --axis: #333333;
+
+  --shadow-card: 0 0 0 1px var(--border);
+  --shadow-raised: 0 0 0 1px var(--border), 0 8px 24px -6px rgb(0 0 0 / 0.6);
+  --shadow-popover: 0 0 0 1px var(--border-2), 0 16px 48px -8px rgb(0 0 0 / 0.8);
+  color-scheme: dark;
 }
 
 @theme inline {
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
-  --color-border: var(--border);
-  --color-text: var(--text);
-  --color-muted: var(--muted);
-  --color-brand: var(--brand);
-  --color-brand-hover: var(--brand-hover);
-  --color-brand-soft: var(--brand-soft);
-  --color-ok: var(--ok);
-  --color-ok-soft: var(--ok-soft);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--border);
+  --color-line-2: var(--border-2);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-link: var(--link);
+  --color-good: var(--good);
+  --color-good-text: var(--good-text);
+  --color-good-soft: var(--good-soft);
   --color-warn: var(--warn);
+  --color-warn-text: var(--warn-text);
   --color-warn-soft: var(--warn-soft);
   --color-bad: var(--bad);
+  --color-bad-text: var(--bad-text);
   --color-bad-soft: var(--bad-soft);
   --color-info: var(--info);
+  --color-info-text: var(--info-text);
   --color-info-soft: var(--info-soft);
-  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --shadow-card: var(--shadow-card);
+  --shadow-raised: var(--shadow-raised);
+  --shadow-popover: var(--shadow-popover);
 }
 
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Emil Kowalski's curves: the only easings used anywhere in the app */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ------------------------------------------------------------------ base */
 html,
 body,
 #root {
-  height: 100%;
+  min-height: 100%;
 }
 body {
   background: var(--bg);
-  color: var(--text);
+  color: var(--fg);
   font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
 }
 ::selection {
-  background: var(--brand-soft);
+  background: var(--info-soft);
 }
 :focus-visible {
-  outline: 2px solid var(--brand);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--focus);
 }
-@keyframes slide-in {
-  from { transform: translateX(24px); opacity: 0; }
-  to { transform: none; opacity: 1; }
+/* containers that receive programmatic focus (dialogs, sheets, menus) keep their own shadow */
+[role='dialog']:focus-visible,
+[role='alertdialog']:focus-visible,
+[role='menu']:focus-visible,
+[role='listbox']:focus-visible {
+  box-shadow: var(--shadow-popover);
 }
-@keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-3) transparent;
 }
-@keyframes pop {
-  from { transform: translateY(8px) scale(0.98); opacity: 0; }
-  to { transform: none; opacity: 1; }
+code,
+kbd,
+.mono {
+  font-family: var(--font-mono);
 }
+
+/* Pressable feedback (Emil): instant confirmation that the interface heard the click. */
+.pressable {
+  transition:
+    transform 160ms var(--ease-out),
+    background-color 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease,
+    opacity 150ms ease;
+}
+.pressable:active:not(:disabled):not([data-disabled]) {
+  transform: scale(var(--press-scale, 0.97));
+}
+/* large surfaces press more subtly */
+.press-subtle {
+  --press-scale: 0.99;
+}
+
+/* Hover elevation without animating box-shadow: fade in a pre-rendered shadow layer (opacity only). */
+.hover-raise {
+  position: relative;
+}
+.hover-raise::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: var(--shadow-raised);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .hover-raise:hover::after,
+  :where(a, button):hover > .hover-raise::after {
+    opacity: 1;
+  }
+}
+
+/* Occasional group entrances: 40ms stagger, never blocks interaction. */
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.stagger > * {
+  animation: enter 320ms var(--ease-out) both;
+}
+.stagger > *:nth-child(2) { animation-delay: 40ms; }
+.stagger > *:nth-child(3) { animation-delay: 80ms; }
+.stagger > *:nth-child(4) { animation-delay: 120ms; }
+.stagger > *:nth-child(5) { animation-delay: 160ms; }
+.stagger > *:nth-child(6) { animation-delay: 200ms; }
+.stagger > *:nth-child(n + 7) { animation-delay: 240ms; }
+
+@keyframes shimmer {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Reduced motion = fewer, gentler animations, not zero: keep fades, drop movement. */
 @media (prefers-reduced-motion: reduce) {
-  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  .stagger > * {
+    animation-name: fade;
+  }
+  [data-starting-style],
+  [data-ending-style] {
+    transform: none !important;
+  }
+  .pressable:active:not(:disabled) {
+    transform: none;
+  }
+  .motion-safe-only {
+    display: none;
+  }
+}
+@keyframes fade {
+  from { opacity: 0; }
 }

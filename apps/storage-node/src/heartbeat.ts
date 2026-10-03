@@ -13,14 +13,14 @@ export function startHeartbeat(
   let failing = false;
 
   const beat = async () => {
+    const probeMs = await metrics.probe(cfg.DATA_DIR);
     const body: HeartbeatBody = {
       name: cfg.NODE_NAME,
       baseUrl: cfg.publicUrl,
-      metrics: metrics.snapshot({
-        usedBytes: store.usedBytes,
-        capacityBytes: cfg.NODE_CAPACITY_BYTES,
-        blobCount: store.blobCount,
-      }),
+      metrics: metrics.snapshot(
+        { usedBytes: store.usedBytes, capacityBytes: cfg.NODE_CAPACITY_BYTES, blobCount: store.blobCount },
+        probeMs,
+      ),
     };
     try {
       const res = await fetch(`${cfg.API_URL}/internal/nodes/heartbeat`, {

@@ -12,6 +12,8 @@ export interface NodeMetrics {
   errorRate: number;
   blobCount: number;
   uptimeSec: number;
+  /** write+fsync+read of a 4 KB probe file, measured every heartbeat (always present, even when idle) */
+  probeMs?: number;
 }
 
 export interface HeartbeatBody {

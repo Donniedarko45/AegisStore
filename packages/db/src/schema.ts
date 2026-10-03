@@ -200,6 +200,7 @@ export const nodeMetrics = pgTable(
     latencyMsP95: real('latency_ms_p95').notNull(),
     errorRate: real('error_rate').notNull(),
     blobCount: integer('blob_count').notNull(),
+    probeMs: real('probe_ms').notNull().default(0),
   },
   (t) => [index('node_metrics_node_ts_idx').on(t.nodeId, t.ts)],
 );

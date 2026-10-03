@@ -1,0 +1,1 @@
+ALTER TABLE "node_metrics" ADD COLUMN "probe_ms" real DEFAULT 0 NOT NULL;

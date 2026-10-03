@@ -295,6 +295,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
           AND (${q.prefix ?? null}::text IS NULL OR starts_with(o.key, ${q.prefix ?? ''}))
           AND (${q.q ?? null}::text IS NULL OR position(lower(${q.q ?? ''}) in lower(o.key)) > 0)
           AND (${q.class ?? null}::text IS NULL OR v.storage_class = ${q.class ?? ''})
+          AND (${q.delimiter ?? null}::text IS NULL OR position('/' in substr(o.key, length(${q.prefix ?? ''}::text) + 1)) = 0)
       ) t
       WHERE (${q.integrity ?? null}::text IS NULL OR
              (CASE WHEN t.available >= t.target_replicas THEN 'HEALTHY'
@@ -314,6 +315,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
             AND (${q.prefix ?? null}::text IS NULL OR starts_with(o.key, ${q.prefix ?? ''}))
             AND (${q.q ?? null}::text IS NULL OR position(lower(${q.q ?? ''}) in lower(o.key)) > 0)
             AND (${q.class ?? null}::text IS NULL OR v.storage_class = ${q.class ?? ''})
+            AND (${q.delimiter ?? null}::text IS NULL OR position('/' in substr(o.key, length(${q.prefix ?? ''}::text) + 1)) = 0)
         ) t
         WHERE (${q.integrity ?? null}::text IS NULL OR
                (CASE WHEN t.available >= t.target_replicas THEN 'HEALTHY'
@@ -337,7 +339,23 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
       targetReplicas: r.target_replicas,
       createdAt: iso(r.created_at)!,
     }));
-    return { items, total, page: q.page, pageSize: q.pageSize };
+    // folders ("common prefixes") directly below the current prefix
+    let prefixes: { prefix: string; objects: number; bytes: number }[] = [];
+    if (q.delimiter) {
+      prefixes = rowsOf<{ prefix: string; objects: number; bytes: number }>(
+        await ctx.db.execute(sql`
+          SELECT ${q.prefix ?? ''} || split_part(substr(o.key, length(${q.prefix ?? ''}::text) + 1), '/', 1) || '/' AS prefix,
+                 count(*)::int AS objects, coalesce(sum(v.size), 0)::bigint AS bytes
+            FROM ${objects} o JOIN ${objectVersions} v ON v.id = o.current_version_id
+           WHERE o.bucket_id = ${bucket.id} AND v.state = 'ACTIVE'
+             AND starts_with(o.key, ${q.prefix ?? ''})
+             -- the offset is measured by Postgres itself so it always matches substr() (JS .length
+             -- counts UTF-16 units, the database may count code points or bytes)
+             AND position('/' in substr(o.key, length(${q.prefix ?? ''}::text) + 1)) > 0
+           GROUP BY 1 ORDER BY 1 LIMIT 1000`),
+      ).map((r) => ({ ...r, bytes: Number(r.bytes) }));
+    }
+    return { items, prefixes, total, page: q.page, pageSize: q.pageSize };
   });
 
   // -------------------------------------------------------------------------------- details

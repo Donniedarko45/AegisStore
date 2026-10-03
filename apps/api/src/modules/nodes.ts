@@ -6,6 +6,7 @@ import type { AppContext } from '../context';
 import { audit } from '../core/audit';
 import { iso, parse, rowsOf } from '../core/http';
 import { RANGES, rangeOf } from '../core/visibility';
+import { HashRing } from '@aegis/hashring';
 import { ringFor } from '../core/placement';
 import { publishEvent } from '../core/redis';
 import { requireUser } from '../plugins/auth';
@@ -48,22 +49,30 @@ export function nodeRoutes(app: FastifyInstance, ctx: AppContext) {
     };
   });
 
+  // Where an arbitrary key lands on the ring (the browser cannot rely on WebCrypto over plain HTTP).
+  app.get<{ Querystring: { key?: string } }>('/api/nodes/ring/locate', async (req) => {
+    requireUser(req);
+    const key = String(req.query.key ?? '').slice(0, 2048);
+    return { key, pos: HashRing.position(key) };
+  });
+
   // Downsampled metric series for all nodes: one row per time bin, one column per node.
   app.get<{ Querystring: { range?: string } }>('/api/nodes/metrics', async (req) => {
     requireUser(req);
     const range = rangeOf(req.query.range ?? '1h');
     const { interval, step } = RANGES[range];
-    const rows = rowsOf<{ t: Date; name: string; cpu: number; mem: number; disk: number; p50: number; p95: number; err: number }>(
+    const rows = rowsOf<{ t: Date; name: string; cpu: number; mem: number; disk: number; p50: number; p95: number; err: number; probe: number }>(
       await ctx.db.execute(sql`
         SELECT date_bin(${step}::interval, m.ts, 'epoch'::timestamptz) AS t, n.name,
                avg(m.cpu_pct)::real AS cpu, avg(m.mem_pct)::real AS mem, max(m.disk_used_pct)::real AS disk,
-               avg(m.latency_ms_p50)::real AS p50, max(m.latency_ms_p95)::real AS p95, avg(m.error_rate)::real AS err
+               avg(m.latency_ms_p50)::real AS p50, max(m.latency_ms_p95)::real AS p95, avg(m.error_rate)::real AS err,
+               avg(m.probe_ms)::real AS probe
           FROM node_metrics m JOIN storage_nodes n ON n.id = m.node_id
          WHERE m.ts >= now() - ${interval}::interval
          GROUP BY 1, 2 ORDER BY 1`),
     );
     const names = [...new Set(rows.map((r) => r.name))].sort();
-    const pivot = (k: 'cpu' | 'mem' | 'disk' | 'p50' | 'p95' | 'err') => {
+    const pivot = (k: 'cpu' | 'mem' | 'disk' | 'p50' | 'p95' | 'err' | 'probe') => {
       const byT = new Map<string, Record<string, number | string>>();
       for (const r of rows) {
         const t = iso(r.t)!;
@@ -73,7 +82,7 @@ export function nodeRoutes(app: FastifyInstance, ctx: AppContext) {
       }
       return [...byT.values()];
     };
-    return { range, step, nodes: names, cpu: pivot('cpu'), mem: pivot('mem'), disk: pivot('disk'), latencyP50: pivot('p50'), latencyP95: pivot('p95'), errorRate: pivot('err') };
+    return { range, step, nodes: names, cpu: pivot('cpu'), mem: pivot('mem'), disk: pivot('disk'), latencyP50: pivot('p50'), latencyP95: pivot('p95'), errorRate: pivot('err'), probe: pivot('probe') };
   });
 
   // Status-page style availability, reconstructed from node.registered/offline/online audit events.
