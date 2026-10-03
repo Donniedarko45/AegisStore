@@ -142,10 +142,13 @@ export async function reconcile(ctx: WorkerCtx, cfg: HealConfig): Promise<Reconc
     const reps = v.reps ?? [];
     const healthy = reps.filter((r) => r.state === 'HEALTHY');
     const good = healthy.filter((r) => isDurable(byId.get(r.node_id)));
-    // replicas on a node that went OFFLINE only moments ago: give it a chance to come back
+    // replicas on a node that just missed heartbeats (not declared OFFLINE yet) or went OFFLINE
+    // only moments ago: give it a chance to come back instead of thrashing on a quick restart
     const graced = healthy.filter((r) => {
       const n = byId.get(r.node_id);
-      return n?.status === 'OFFLINE' && (n.offline_for_ms ?? Infinity) < cfg.healGraceMs;
+      if (!n || isDurable(n)) return false;
+      if (n.status === 'OFFLINE') return (n.offline_for_ms ?? Infinity) < cfg.healGraceMs;
+      return !n.fresh && DURABLE_STATUSES.includes(n.status);
     });
     const readable = healthy.filter((r) => byId.get(r.node_id)?.fresh && byId.get(r.node_id)?.status !== 'OFFLINE');
     const priority = good.length <= 1 ? 10 : v.storage_class === 'HOT' ? 20 : 50;

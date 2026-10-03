@@ -7,6 +7,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   real,
   text,
   timestamp,
@@ -115,6 +116,10 @@ export const objects = pgTable(
     currentVersionId: uuid('current_version_id'),
     createdAt: createdAt(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    lastAccessedAt: timestamp('last_accessed_at', { withTimezone: true }),
+    /** last time the object qualified as HOT (demotion hysteresis, §9.3) */
+    lastHotAt: timestamp('last_hot_at', { withTimezone: true }),
+    classChangedAt: timestamp('class_changed_at', { withTimezone: true }),
   },
   (t) => [
     unique('objects_bucket_key_uq').on(t.bucketId, t.key),
@@ -148,6 +153,18 @@ export const objectVersions = pgTable(
     index('object_versions_state_purge_idx').on(t.state, t.purgeAfter),
     index('object_versions_object_idx').on(t.objectId),
   ],
+);
+
+/** Reads per object per hour: the input to HOT / WARM / COLD classification (§9.3). */
+export const objectAccess = pgTable(
+  'object_access',
+  {
+    objectId: uuid('object_id').notNull().references(() => objects.id, { onDelete: 'cascade' }),
+    hour: timestamp('hour', { withTimezone: true }).notNull(),
+    reads: integer('reads').notNull().default(0),
+    bytes: bytes('bytes').notNull().default(0),
+  },
+  (t) => [primaryKey({ columns: [t.objectId, t.hour] }), index('object_access_hour_idx').on(t.hour)],
 );
 
 export const storageNodes = pgTable('storage_nodes', {

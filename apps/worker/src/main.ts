@@ -8,6 +8,7 @@ import { runGc } from './jobs/gc';
 import { sweepNodeHealth } from './jobs/health-sweeper';
 import { rollupMetrics } from './jobs/metrics-rollup';
 import { purgeExpired } from './jobs/retention-purge';
+import { classifyObjects, pruneAccess } from './jobs/classifier';
 import { JobRunner, reconcile, scrub } from './jobs/healing';
 import { scoreNodes } from './jobs/risk-scorer';
 import { becomeLeader } from './leader';
@@ -83,5 +84,15 @@ if (leader) {
   every('reconciler', cfg.RECONCILE_INTERVAL_MS, () => reconcile(ctx, heal));
   every('scrubber', cfg.SCRUB_INTERVAL_MS, () => scrub(ctx, { offlineAfterMs: cfg.OFFLINE_AFTER_MS, batch: cfg.SCRUB_BATCH, maxAgeHours: cfg.SCRUB_MAX_AGE_HOURS }));
   every('job-runner', cfg.JOB_POLL_MS, () => runner.tick());
+  every('classifier', cfg.CLASSIFY_INTERVAL_MS, () =>
+    classifyObjects(ctx, {
+      hotReads24h: cfg.HOT_READS_24H,
+      hotReads7d: cfg.HOT_READS_7D,
+      hotDemoteHours: cfg.HOT_DEMOTE_HOURS,
+      coldAfterDays: cfg.COLD_AFTER_DAYS,
+      hotReplicas: cfg.HOT_REPLICAS,
+    }),
+  );
+  every('access-prune', cfg.GC_INTERVAL_MS, () => pruneAccess(ctx, Math.max(8, cfg.COLD_AFTER_DAYS + 1)));
   log.info('schedulers running');
 }

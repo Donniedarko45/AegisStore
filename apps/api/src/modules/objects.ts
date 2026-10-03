@@ -24,8 +24,12 @@ import { requireUser } from '../plugins/auth';
 
 type Q = { key?: string; versionId?: string };
 
-export const integrityOf = (available: number, target: number): IntegrityStatus =>
-  available >= target ? 'HEALTHY' : available === 0 ? 'UNAVAILABLE' : 'DEGRADED';
+/**
+ * Integrity is judged against the durability baseline (the bucket's replica count): a HOT object
+ * whose *extra* copy is still being created is not degraded. `target` may be higher than that.
+ */
+export const integrityOf = (available: number, target: number, baseline = target): IntegrityStatus =>
+  available >= Math.min(target, baseline) ? 'HEALTHY' : available === 0 ? 'UNAVAILABLE' : 'DEGRADED';
 
 function keyFrom(q: Q): string {
   try {
@@ -298,7 +302,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
           AND (${q.delimiter ?? null}::text IS NULL OR position('/' in substr(o.key, length(${q.prefix ?? ''}::text) + 1)) = 0)
       ) t
       WHERE (${q.integrity ?? null}::text IS NULL OR
-             (CASE WHEN t.available >= t.target_replicas THEN 'HEALTHY'
+             (CASE WHEN t.available >= least(t.target_replicas, ${bucket.defaultReplicas}) THEN 'HEALTHY'
                    WHEN t.available = 0 THEN 'UNAVAILABLE' ELSE 'DEGRADED' END) = ${q.integrity ?? ''})
       ORDER BY ${sortCol} ${dir}, t.key ASC
       LIMIT ${q.pageSize} OFFSET ${(q.page - 1) * q.pageSize}`);
@@ -318,7 +322,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
             AND (${q.delimiter ?? null}::text IS NULL OR position('/' in substr(o.key, length(${q.prefix ?? ''}::text) + 1)) = 0)
         ) t
         WHERE (${q.integrity ?? null}::text IS NULL OR
-               (CASE WHEN t.available >= t.target_replicas THEN 'HEALTHY'
+               (CASE WHEN t.available >= least(t.target_replicas, ${bucket.defaultReplicas}) THEN 'HEALTHY'
                      WHEN t.available = 0 THEN 'UNAVAILABLE' ELSE 'DEGRADED' END) = ${q.integrity ?? ''})`),
     );
 
@@ -334,7 +338,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
       contentType: r.content_type,
       sha256: r.sha256,
       storageClass: r.storage_class,
-      integrity: integrityOf(r.available, r.target_replicas),
+      integrity: integrityOf(r.available, r.target_replicas, bucket.defaultReplicas),
       availableReplicas: r.available,
       targetReplicas: r.target_replicas,
       createdAt: iso(r.created_at)!,
@@ -393,7 +397,7 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
         lastVerifiedAt: iso(r.lastVerifiedAt),
       }));
       const available = rs.filter(({ r, node }) => r.state === 'HEALTHY' && node.status !== 'OFFLINE').length;
-      integrity = integrityOf(available, current.targetReplicas);
+      integrity = integrityOf(available, current.targetReplicas, bucket.defaultReplicas);
     }
 
     let placement: { key: string; ringPos: number; ringOrder: string[] } | null = null;
@@ -409,10 +413,31 @@ export function objectRoutes(app: FastifyInstance, ctx: AppContext) {
       };
     }
 
+    const hourly = rowsOf<{ hour: Date; reads: number }>(
+      await ctx.db.execute(sql`
+        SELECT h AS hour, coalesce(a.reads, 0)::int AS reads
+          FROM generate_series(date_trunc('hour', now()) - interval '47 hours', date_trunc('hour', now()), interval '1 hour') h
+          LEFT JOIN object_access a ON a.object_id = ${obj.id} AND a.hour = h
+         ORDER BY h`),
+    );
+    const [totals] = rowsOf<{ r24: number; r7: number }>(
+      await ctx.db.execute(sql`
+        SELECT coalesce(sum(reads) FILTER (WHERE hour > now() - interval '24 hours'), 0)::int AS r24,
+               coalesce(sum(reads), 0)::int AS r7
+          FROM object_access WHERE object_id = ${obj.id} AND hour > now() - interval '7 days'`),
+    );
+
     return {
       key,
       bucket: bucket.name,
       placement,
+      access: {
+        reads24h: totals?.r24 ?? 0,
+        reads7d: totals?.r7 ?? 0,
+        lastAccessedAt: iso(obj.lastAccessedAt),
+        classChangedAt: iso(obj.classChangedAt),
+        hourly: hourly.map((h) => ({ t: iso(h.hour), reads: h.reads })),
+      },
       current: current && {
         versionId: current.id,
         versionNo: current.versionNo,
@@ -677,6 +702,21 @@ const STATUS_RANK: Record<string, number> = { HEALTHY: 0, WARNING: 1, HIGH_RISK:
 
 /** downloads currently held in memory for verify-before-send (capped to bound API memory) */
 let bufferedInFlight = 0;
+/** reads currently being served per node, for least-loaded replica selection */
+const inFlight = new Map<string, number>();
+const track = (nodeId: string, d: 1 | -1) => inFlight.set(nodeId, Math.max(0, (inFlight.get(nodeId) ?? 0) + d));
+
+/** Count a read for HOT / WARM / COLD classification (hourly buckets; never blocks the download). */
+function recordAccess(ctx: AppContext, objectId: string, size: number) {
+  void ctx.db
+    .execute(sql`
+      WITH a AS (
+        INSERT INTO object_access (object_id, hour, reads, bytes) VALUES (${objectId}, date_trunc('hour', now()), 1, ${size})
+        ON CONFLICT (object_id, hour) DO UPDATE SET reads = object_access.reads + 1, bytes = object_access.bytes + excluded.bytes
+      )
+      UPDATE objects SET last_accessed_at = now() WHERE id = ${objectId}`)
+    .catch((err: unknown) => ctx.log.warn({ err: String(err) }, 'access stats write failed'));
+}
 
 async function flagReplica(
   ctx: AppContext,
@@ -714,9 +754,13 @@ async function serveObject(
   // Healthiest nodes first; shuffle within a tier so reads spread across equally good replicas.
   // Replicas on OFFLINE-marked nodes are kept as a last resort: the status may be stale (e.g. the
   // worker is lagging) and trying costs nothing when every better option has already failed.
+  // Within a tier, prefer the least-loaded node (reads in flight here, then its recent latency),
+  // with a little jitter so equal nodes share the load. This is what makes HOT objects' extra
+  // replica useful: their reads spread across three nodes.
+  const load = (n: NodeRow) => (inFlight.get(n.id) ?? 0) + (n.lastMetrics?.latencyMsP95 ?? 0) / 50;
   const ordered = candidates
-    .map((c) => ({ ...c, jitter: Math.random() }))
-    .sort((a, b) => (STATUS_RANK[a.node.status]! - STATUS_RANK[b.node.status]!) || a.jitter - b.jitter);
+    .map((c) => ({ ...c, jitter: Math.random() * 0.5 }))
+    .sort((a, b) => (STATUS_RANK[a.node.status]! - STATUS_RANK[b.node.status]!) || load(a.node) + a.jitter - (load(b.node) + b.jitter));
 
   const expected = version.sha256!;
   const attempts: string[] = [];
@@ -747,6 +791,7 @@ async function serveObject(
     const buffered = version.size <= ctx.cfg.VERIFY_BUFFER_MAX_BYTES && bufferedInFlight < ctx.cfg.VERIFY_BUFFER_CONCURRENCY;
     if (buffered) {
       bufferedInFlight++;
+      track(node.id, 1);
       try {
         const chunks: Buffer[] = [];
         for await (const c of blob.stream) chunks.push(c as Buffer);
@@ -759,12 +804,14 @@ async function serveObject(
           continue;
         }
         await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, fallbacks: attempts.length } });
+        recordAccess(ctx, version.objectId, version.size);
         return reply.header('x-aegis-integrity', 'verified').send(body);
       } catch (err) {
         attempts.push(`${node.name}: ${(err as Error).message}`);
         continue;
       } finally {
         bufferedInFlight--;
+        track(node.id, -1);
       }
     }
 
@@ -784,6 +831,9 @@ async function serveObject(
       },
     });
     await audit(ctx, req, { action: 'object.download', resourceType: 'object', resourceId: version.objectId, metadata: { bucket: bucket.name, key, size: version.size, versionId: version.id, servedBy: node.name, streamed: true } });
+    recordAccess(ctx, version.objectId, version.size);
+    track(node.id, 1);
+    reply.raw.once('close', () => track(node.id, -1));
     return reply.header('x-aegis-integrity', 'streaming').send(pipeline(blob.stream, verifier, () => undefined));
   }
 

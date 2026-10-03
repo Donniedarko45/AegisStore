@@ -64,10 +64,10 @@ export function analyticsRoutes(app: FastifyInstance, ctx: AppContext) {
     );
 
     const current = sql`
-      SELECT v.*, o.bucket_id, o.key,
+      SELECT v.*, o.bucket_id, o.key, least(v.target_replicas, b.default_replicas) AS baseline,
              (SELECT count(*) FROM replicas r JOIN storage_nodes n ON n.id = r.node_id
                WHERE r.version_id = v.id AND r.state = 'HEALTHY' AND n.status <> 'OFFLINE')::int AS available
-        FROM objects o JOIN object_versions v ON v.id = o.current_version_id
+        FROM objects o JOIN object_versions v ON v.id = o.current_version_id JOIN buckets b ON b.id = o.bucket_id
        WHERE o.bucket_id IN ${visible} AND v.state = 'ACTIVE'`;
 
     const byType = rowsOf<{ type: string; objects: number; bytes: number }>(
@@ -84,8 +84,8 @@ export function analyticsRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     const [integrity] = rowsOf<{ healthy: number; degraded: number; unavailable: number }>(
       await ctx.db.execute(sql`
-        SELECT count(*) FILTER (WHERE available >= target_replicas)::int AS healthy,
-               count(*) FILTER (WHERE available > 0 AND available < target_replicas)::int AS degraded,
+        SELECT count(*) FILTER (WHERE available >= baseline)::int AS healthy,
+               count(*) FILTER (WHERE available > 0 AND available < baseline)::int AS degraded,
                count(*) FILTER (WHERE available = 0)::int AS unavailable
           FROM (${current}) c`),
     );

@@ -22,6 +22,13 @@
       "when": 1791024733996,
       "tag": "0002_risk_and_healing",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791025789603,
+      "tag": "0003_access_classes",
+      "breakpoints": true
     }
   ]
 }

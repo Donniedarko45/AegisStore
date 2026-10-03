@@ -25,6 +25,13 @@ const schema = z.object({
   SCRUB_INTERVAL_MS: envInt(60_000),
   SCRUB_BATCH: envInt(25),
   SCRUB_MAX_AGE_HOURS: envInt(168),
+  /** HOT / WARM / COLD classification and adaptive replication (§9.3, §9.4) */
+  CLASSIFY_INTERVAL_MS: envInt(30_000),
+  HOT_READS_24H: envInt(20),
+  HOT_READS_7D: envInt(100),
+  HOT_DEMOTE_HOURS: envInt(48),
+  COLD_AFTER_DAYS: envInt(14),
+  HOT_REPLICAS: envInt(3),
   LOG_LEVEL: z.string().default('info'),
 });
 export type Config = z.infer<typeof schema>;
