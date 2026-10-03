@@ -128,3 +128,41 @@ describe('storage node', () => {
     expect((await readFile(store.blobPath(blobId))).toString()).toBe('bit rot!!!!!!!');
   });
 });
+
+describe('multipart parts', () => {
+  const putPart = (uploadId: string, n: number, body: Buffer) =>
+    fetch(`${base}/internal/parts/${uploadId}/${n}`, { method: 'PUT', headers: { ...auth, 'content-type': 'application/octet-stream' }, body });
+
+  it('stores parts and composes them in order into one verified blob', async () => {
+    const uploadId = id();
+    const a = Buffer.from('a'.repeat(1000));
+    const b = Buffer.from('b'.repeat(500));
+    // out of order, and part 1 re-uploaded: the last upload of a part number wins
+    expect((await json(await putPart(uploadId, 2, b))).sha256).toBe(sha(b));
+    await putPart(uploadId, 1, Buffer.from('wrong'));
+    expect((await json(await putPart(uploadId, 1, a))).size).toBe(1000);
+    const blobId = id();
+    const r = await fetch(`${base}/internal/parts/${uploadId}/compose`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ blobId, parts: [1, 2] }),
+    });
+    const c = await json(r);
+    expect(c.sha256).toBe(sha(Buffer.concat([a, b])));
+    expect(c.size).toBe(1500);
+    expect(await readFile(path.join(dir, c.path))).toEqual(Buffer.concat([a, b]));
+    expect(store.partsBytes).toBe(0); // parts are removed after compose
+    expect((await json(await fetch(`${base}/internal/parts/${uploadId}`, { headers: auth }))).parts).toEqual([]);
+  });
+
+  it('refuses to compose with a missing part', async () => {
+    const uploadId = id();
+    await putPart(uploadId, 1, Buffer.from('x'));
+    const r = await fetch(`${base}/internal/parts/${uploadId}/compose`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ blobId: id(), parts: [1, 2] }),
+    });
+    expect(r.status).toBe(409);
+  });
+});

@@ -2,25 +2,28 @@ import type { HeartbeatBody } from '@aegis/shared';
 import type { BlobStore } from './blobstore';
 import type { Config } from './config';
 import type { MetricsCollector } from './metrics';
+import type { Chaos } from './chaos';
 
 export function startHeartbeat(
   cfg: Config,
   store: BlobStore,
   metrics: MetricsCollector,
   log: { warn: (o: unknown, m?: string) => void; info: (m: string) => void },
+  chaos?: Chaos,
 ): () => void {
   let registered = false;
   let failing = false;
 
   const beat = async () => {
+    if (chaos?.state.offline) return; // simulated crash / partition: the control plane stops hearing us
+    const probeMs = await metrics.probe(cfg.DATA_DIR, chaos);
     const body: HeartbeatBody = {
       name: cfg.NODE_NAME,
       baseUrl: cfg.publicUrl,
-      metrics: metrics.snapshot({
-        usedBytes: store.usedBytes,
-        capacityBytes: cfg.NODE_CAPACITY_BYTES,
-        blobCount: store.blobCount,
-      }),
+      metrics: metrics.snapshot(
+        { usedBytes: store.reportedUsedBytes, capacityBytes: cfg.NODE_CAPACITY_BYTES, blobCount: store.blobCount },
+        probeMs,
+      ),
     };
     try {
       const res = await fetch(`${cfg.API_URL}/internal/nodes/heartbeat`, {

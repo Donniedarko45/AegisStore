@@ -34,6 +34,32 @@ export async function runGc(db: Db, storage: StorageClient, log: Logger, metrics
   const n = (removed as unknown as { rows: unknown[] }).rows.length;
   if (n) log.info({ count: n }, 'removed abandoned pending uploads');
 
+  // object rows whose every upload failed before producing a version (no history, no current)
+  await db.execute(sql`
+    DELETE FROM objects o
+     WHERE o.current_version_id IS NULL
+       AND o.updated_at < now() - interval '1 hour'
+       AND NOT EXISTS (SELECT 1 FROM object_versions v WHERE v.object_id = o.id)`);
+
+  // versions protected after an attack become ordinary again when their protection window ends
+  await db.execute(sql`UPDATE object_versions SET is_protected = false WHERE is_protected AND protected_until <= now()`);
+  // multipart uploads nobody completed: remove their parts from the nodes
+  const stale = (
+    (await db.execute(sql`
+      UPDATE multipart_uploads SET state = 'ABORTED' WHERE state = 'ACTIVE' AND expires_at < now()
+      RETURNING id, node_ids`)) as unknown as { rows: { id: string; node_ids: string[] }[] }
+  ).rows;
+  for (const up of stale) {
+    const nodes = (
+      (await db.execute(sql`SELECT id, name, base_url FROM storage_nodes WHERE id IN (${sql.join(up.node_ids.map((id) => sql`${id}::uuid`), sql`, `)})`)) as unknown as {
+        rows: { id: string; name: string; base_url: string }[];
+      }
+    ).rows;
+    await Promise.allSettled(nodes.map((n) => storage.abortParts({ id: n.id, name: n.name, baseUrl: n.base_url }, up.id)));
+    await db.execute(sql`DELETE FROM multipart_parts WHERE upload_id = ${up.id}`);
+  }
+  if (stale.length) log.info({ count: stale.length }, 'aborted expired multipart uploads');
+  await db.execute(sql`DELETE FROM share_links WHERE expires_at < now() - interval '30 days'`);
   await db.execute(sql`DELETE FROM sessions WHERE expires_at < now()`);
   await db.execute(sql`DELETE FROM node_metrics WHERE ts < now() - make_interval(days => ${metricsRetentionDays})`);
 }

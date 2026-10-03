@@ -11,6 +11,7 @@ export type ErrorCode =
   | 'INSUFFICIENT_HEALTHY_NODES'
   | 'STORAGE_UNAVAILABLE'
   | 'UPLOAD_FAILED'
+  | 'BUCKET_PROTECTED'
   | 'INTERNAL';
 
 export class AppError extends Error {

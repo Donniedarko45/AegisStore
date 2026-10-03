@@ -1,5 +1,6 @@
 import { HashRing } from '@aegis/hashring';
-import { storageNodes, type Db } from '@aegis/db';
+import { sql, storageNodes, type Db } from '@aegis/db';
+import { WRITABLE_STATUSES } from '@aegis/shared';
 
 export type NodeRow = typeof storageNodes.$inferSelect;
 
@@ -24,21 +25,42 @@ export interface PlacementOptions {
   expectedSize?: number;
 }
 
-/** A node can take new writes only if it is HEALTHY, recently heard from, and has room. */
-export function isEligible(n: NodeRow, offlineAfterMs: number, size = 0, now = Date.now()): boolean {
-  if (n.status !== 'HEALTHY') return false;
-  if (!n.lastHeartbeatAt || now - n.lastHeartbeatAt.getTime() > offlineAfterMs) return false;
+/**
+ * A node can take new writes only if it is HEALTHY or WARNING (HIGH_RISK nodes are being
+ * evacuated, DRAINING ones emptied), recently heard from, and has room.
+ * `fresh` must be computed by the database (heartbeat timestamps are written with the DB clock).
+ */
+export function isEligible(n: NodeRow, fresh: boolean, size = 0): boolean {
+  if (!WRITABLE_STATUSES.includes(n.status) || !fresh) return false;
   return n.capacityBytes - n.usedBytes > size;
 }
 
 /** Choose `replicas` distinct eligible nodes for a placement key using the consistent hash ring. */
-export async function pickNodes(db: Db, placementKey: string, opts: PlacementOptions): Promise<NodeRow[]> {
-  const nodes = await db.select().from(storageNodes);
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const ring = ringFor(nodes, opts.vnodes);
+export async function pickNodes(db: Db, placementKey: string, opts: PlacementOptions & { exclude?: Set<string> }): Promise<NodeRow[]> {
+  const rows = await db
+    .select({
+      node: storageNodes,
+      fresh: sql<boolean>`coalesce(${storageNodes.lastHeartbeatAt} > now() - make_interval(secs => ${opts.offlineAfterMs / 1000}), false)`,
+    })
+    .from(storageNodes);
+  const byId = new Map(rows.map((r) => [r.node.id, r]));
+  const ring = ringFor(rows.map((r) => r.node), opts.vnodes);
+  const room = (r: (typeof rows)[number]) => r.node.capacityBytes - r.node.usedBytes > (opts.expectedSize ?? 0);
   const ids = ring.getNodes(placementKey, opts.replicas, (id) => {
-    const n = byId.get(id);
-    return !!n && isEligible(n, opts.offlineAfterMs, opts.expectedSize ?? 0);
+    const r = byId.get(id);
+    return !!r && !opts.exclude?.has(id) && isEligible(r.node, r.fresh, opts.expectedSize ?? 0);
   });
-  return ids.map((id) => byId.get(id)!);
+  if (ids.length < opts.replicas) {
+    // A risk *prediction* must never cause a write outage: when there are not enough HEALTHY /
+    // WARNING nodes, fall back to reachable HIGH_RISK ones (never OFFLINE or DRAINING). The
+    // self-healing worker moves those copies off again once better nodes are available.
+    const chosen = new Set(ids);
+    ids.push(
+      ...ring.getNodes(placementKey, opts.replicas - ids.length, (id) => {
+        const r = byId.get(id);
+        return !!r && !chosen.has(id) && !opts.exclude?.has(id) && r.fresh && r.node.status === 'HIGH_RISK' && room(r);
+      }),
+    );
+  }
+  return ids.map((id) => byId.get(id)!.node);
 }

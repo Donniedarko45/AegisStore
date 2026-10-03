@@ -62,4 +62,16 @@ describe('HashRing', () => {
     // ideal is 25%; allow slack for vnode variance, but far below the ~75% of modulo hashing
     expect(moved / keys.length).toBeLessThan(0.4);
   });
+
+  it('exposes sorted points and key positions consistent with lookups', () => {
+    const ring = new HashRing(['n1', 'n2', 'n3'], 16);
+    const pts = ring.points();
+    expect(pts).toHaveLength(48);
+    for (let i = 1; i < pts.length; i++) expect(pts[i]!.pos).toBeGreaterThanOrEqual(pts[i - 1]!.pos);
+    for (const k of keys.slice(0, 200)) {
+      const pos = HashRing.position(k);
+      const first = pts.find((p) => p.pos >= pos) ?? pts[0]!;
+      expect(ring.getNodes(k, 1)[0]).toBe(first.node);
+    }
+  });
 });

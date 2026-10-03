@@ -17,6 +17,9 @@ export const registerSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
 });
 export const loginSchema = z.object({ email: emailSchema, password: z.string().min(1).max(200) });
+export const changePasswordSchema = z
+  .object({ currentPassword: z.string().min(1).max(200), newPassword: passwordSchema })
+  .refine((v) => v.currentPassword !== v.newPassword, { message: 'New password must differ from the current one', path: ['newPassword'] });
 
 export const createBucketSchema = z.object({
   name: bucketNameSchema,
@@ -26,6 +29,10 @@ export const createBucketSchema = z.object({
 export const updateBucketSchema = z.object({
   versioningEnabled: z.boolean().optional(),
   publicRead: z.boolean().optional(),
+  /** locked: deletes and overwrites are refused (423) */
+  protectedMode: z.boolean().optional(),
+  /** lock automatically when a HIGH+ attack is detected */
+  autoLock: z.boolean().optional(),
 });
 
 export const setGrantSchema = z.object({
@@ -44,6 +51,8 @@ export const listObjectsQuerySchema = z.object({
   q: z.string().max(200).optional(),
   integrity: z.enum(['HEALTHY', 'DEGRADED', 'UNAVAILABLE']).optional(),
   class: z.enum(['HOT', 'WARM', 'COLD']).optional(),
+  /** '/' groups keys into folders (S3 common prefixes) below `prefix` */
+  delimiter: z.literal('/').optional(),
   sort: z.enum(['key', 'size', 'createdAt']).default('createdAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
   page: z.coerce.number().int().min(1).default(1),
@@ -77,5 +86,6 @@ export const HeartbeatBodyGuard = z.object({
     errorRate: finite,
     blobCount: finite.int().nonnegative(),
     uptimeSec: finite,
+    probeMs: finite.nonnegative().optional(),
   }),
 });

@@ -12,6 +12,15 @@ import { bucketRoutes } from './modules/buckets';
 import { dashboardRoutes } from './modules/dashboard';
 import { internalRoutes, nodeRoutes } from './modules/nodes';
 import { objectRoutes } from './modules/objects';
+import { analyticsRoutes } from './modules/analytics';
+import { createEventHub, eventRoutes } from './modules/events';
+import { systemRoutes } from './modules/system';
+import { healingRoutes } from './modules/healing';
+import { securityRoutes } from './modules/security';
+import { multipartRoutes } from './modules/multipart';
+import { shareRoutes } from './modules/shares';
+import { simulationRoutes } from './modules/simulation';
+import { userRoutes } from './modules/users';
 import { registerAuth } from './plugins/auth';
 
 function statusToCode(status: number): ErrorCode {
@@ -26,7 +35,9 @@ function statusToCode(status: number): ErrorCode {
 export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   const app = Fastify({
     logger: ctx.log.level ? { level: ctx.cfg.LOG_LEVEL } : false,
-    trustProxy: true,
+    // trust only our own proxy hops (hop 0 = the socket peer, e.g. nginx); the client's own
+    // X-Forwarded-For entries are never trusted
+    trustProxy: (_addr: string, hop: number) => hop < ctx.cfg.TRUST_PROXY_HOPS,
     genReqId: (req) => (req.headers['x-request-id'] as string | undefined)?.slice(0, 100) ?? randomUUID(),
   });
 
@@ -68,7 +79,11 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
     try {
       await ctx.db.execute(sql`SELECT 1`);
       const [n] = rowsOf<{ healthy: number }>(
-        await ctx.db.execute(sql`SELECT count(*)::int AS healthy FROM storage_nodes WHERE status = 'HEALTHY'`),
+        // same rule as write placement: HEALTHY *and* heard from recently (status alone may be stale
+        // if the worker is down)
+        await ctx.db.execute(sql`
+          SELECT count(*)::int AS healthy FROM storage_nodes
+          WHERE status IN ('HEALTHY', 'WARNING', 'HIGH_RISK') AND last_heartbeat_at > now() - make_interval(secs => ${ctx.cfg.OFFLINE_AFTER_MS / 1000})`),
       );
       const ready = (n?.healthy ?? 0) >= ctx.cfg.REPLICATION_FACTOR;
       return reply.code(ready ? 200 : 503).send({ ready, healthyNodes: n?.healthy ?? 0, required: ctx.cfg.REPLICATION_FACTOR });
@@ -84,6 +99,17 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   nodeRoutes(app, ctx);
   dashboardRoutes(app, ctx);
   auditRoutes(app, ctx);
+  analyticsRoutes(app, ctx);
+  userRoutes(app, ctx);
+  systemRoutes(app, ctx);
+  healingRoutes(app, ctx);
+  securityRoutes(app, ctx);
+  multipartRoutes(app, ctx);
+  shareRoutes(app, ctx);
+  simulationRoutes(app, ctx);
+  const hub = createEventHub(ctx.cfg.REDIS_URL, ctx.log);
+  app.addHook('onClose', async () => hub.close());
+  eventRoutes(app, ctx, hub);
   internalRoutes(app, ctx);
   return app;
 }

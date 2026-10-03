@@ -11,7 +11,20 @@ const api = { target, changeOrigin: false, xfwd: true };
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  server: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/healthz': api } },
-  preview: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/healthz': api } },
-  build: { sourcemap: false, chunkSizeWarningLimit: 900 },
+  server: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/s/': api, '/healthz': api } },
+  preview: { port: 8080, host: '0.0.0.0', proxy: { '/api': api, '/s/': api, '/healthz': api } },
+  build: {
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        // long-lived vendor chunks: app deploys do not invalidate them
+        manualChunks: {
+          react: ['react', 'react-dom', 'react-router-dom', '@tanstack/react-query'],
+          charts: ['recharts'],
+          live: ['liveline'],
+          ui: ['@base-ui/react', 'cmdk', 'sonner', '@number-flow/react'],
+        },
+      },
+    },
+  },
 });

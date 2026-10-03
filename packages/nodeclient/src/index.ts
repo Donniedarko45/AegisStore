@@ -1,5 +1,6 @@
 import { Agent as HttpAgent, request as httpRequest } from 'node:http';
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 
 export interface NodeRef {
@@ -39,10 +40,22 @@ export class NodeHttpError extends Error {
   }
 }
 
+/** Why a node-to-node copy failed, so callers can react (flag the source vs. retry elsewhere). */
+export class CopyError extends Error {
+  constructor(
+    public readonly kind: 'SOURCE_UNAVAILABLE' | 'SOURCE_MISSING' | 'SOURCE_CORRUPT' | 'TARGET_FAILED' | 'TARGET_MISMATCH',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 64 });
 const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64 });
 
 const CONTROL_TIMEOUT_MS = 10_000;
+/** composing a multi-GB object reads and writes every byte once */
+const COMPOSE_TIMEOUT_MS = 10 * 60_000;
 
 /** Typed client for the storage nodes' internal API. Knows nothing about buckets or users. */
 export class StorageClient {
@@ -56,7 +69,7 @@ export class StorageClient {
     const res = await fetch(`${node.baseUrl}${path}`, {
       ...init,
       headers: { ...this.headers(requestId), ...(init.headers as Record<string, string> | undefined) },
-      signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+      signal: AbortSignal.timeout(path.endsWith('/compose') ? COMPOSE_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     });
     if (!res.ok) throw new NodeHttpError(res.status, `${node.name}: ${path} -> ${res.status}`);
     return (await res.json()) as T;
@@ -64,7 +77,31 @@ export class StorageClient {
 
   /** Start a streamed PUT to `node`. The caller writes chunks and then calls `end()`. */
   startStage(node: NodeRef, blobId: string, opts: { requestId?: string; expectedSize?: number } = {}): StageSink {
-    const url = new URL(`${node.baseUrl}/internal/blobs/${blobId}/stage`);
+    return this.startPut(node, `/internal/blobs/${blobId}/stage`, opts);
+  }
+
+  /** Streamed PUT of one multipart part (same sink contract as a stage). */
+  startPart(node: NodeRef, uploadId: string, partNo: number, opts: { requestId?: string; expectedSize?: number } = {}): StageSink {
+    return this.startPut(node, `/internal/parts/${uploadId}/${partNo}`, opts);
+  }
+
+  /** Concatenate an upload's parts into a committed blob on the node. */
+  compose(node: NodeRef, uploadId: string, blobId: string, parts: number[], requestId?: string) {
+    return this.json<{ size: number; sha256: string; path: string }>(
+      node,
+      `/internal/parts/${uploadId}/compose`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ blobId, parts }) },
+      requestId,
+    );
+  }
+
+  /** Best effort: remove an upload's parts from the node. */
+  abortParts(node: NodeRef, uploadId: string) {
+    return this.json(node, `/internal/parts/${uploadId}`, { method: 'DELETE' }).catch(() => undefined);
+  }
+
+  private startPut(node: NodeRef, path: string, opts: { requestId?: string; expectedSize?: number }): StageSink {
+    const url = new URL(`${node.baseUrl}${path}`);
     const secure = url.protocol === 'https:';
     const req = (secure ? httpsRequest : httpRequest)(
       {
@@ -137,8 +174,19 @@ export class StorageClient {
     return this.json(node, `/internal/blobs/${blobId}/stage/${stagedToken}`, { method: 'DELETE' }).catch(() => undefined);
   }
 
+  /** Best effort: never throws (used for cleanup after failed writes). */
   deleteBlob(node: NodeRef, blobId: string) {
     return this.json(node, `/internal/blobs/${blobId}`, { method: 'DELETE' }).catch(() => undefined);
+  }
+
+  /** True only when the node confirmed the blob is gone (deleted now or already absent). */
+  async tryDeleteBlob(node: NodeRef, blobId: string): Promise<boolean> {
+    try {
+      await this.json(node, `/internal/blobs/${blobId}`, { method: 'DELETE' });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   verify(node: NodeRef, blobId: string) {
@@ -175,4 +223,86 @@ export class StorageClient {
       clearTimeout(timer);
     }
   }
+
+  /**
+   * Copy one committed blob from `from` to `to` through this process (constant memory, honours
+   * backpressure). The bytes are hashed in flight and must match `expectedSha256` both here and on
+   * the target before the target commits, so a copy can never spread corruption.
+   */
+  async copyBlob(
+    from: NodeRef,
+    to: NodeRef,
+    blobId: string,
+    expected: { sha256: string; size: number },
+    requestId?: string,
+  ): Promise<{ size: number; path: string }> {
+    let src;
+    try {
+      src = await this.openBlob(from, blobId, requestId);
+    } catch (err) {
+      throw new CopyError('SOURCE_UNAVAILABLE', `${from.name}: ${(err as Error).message}`);
+    }
+    if (src.status === 404) throw new CopyError('SOURCE_MISSING', `${from.name}: blob missing`);
+    if (!src.stream) throw new CopyError('SOURCE_UNAVAILABLE', `${from.name}: HTTP ${src.status}`);
+
+    const sink = this.startStage(to, blobId, { requestId, expectedSize: expected.size });
+    const hash = createHash('sha256');
+    let size = 0;
+    try {
+      for await (const chunk of src.stream) {
+        const buf = chunk as Buffer;
+        hash.update(buf);
+        size += buf.length;
+        if (sink.failed) throw sink.failed;
+        if (!sink.write(buf)) await Promise.race([sink.drained(), sink.errored]);
+      }
+      sink.end();
+    } catch (err) {
+      sink.destroy(err as Error);
+      src.stream.destroy();
+      throw new CopyError('TARGET_FAILED', `${to.name}: ${(err as Error).message}`);
+    }
+    let staged: StagedResult;
+    try {
+      staged = await sink.result;
+    } catch (err) {
+      throw new CopyError('TARGET_FAILED', (err as Error).message);
+    }
+    const actual = hash.digest('hex');
+    if (actual !== expected.sha256 || size !== expected.size) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('SOURCE_CORRUPT', `${from.name}: source bytes do not match the recorded checksum`);
+    }
+    if (staged.sha256 !== expected.sha256 || staged.size !== expected.size) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('TARGET_MISMATCH', `${to.name}: staged checksum mismatch`);
+    }
+    try {
+      const c = await this.commit(to, blobId, staged.stagedToken, requestId);
+      return { size: c.size, path: c.path };
+    } catch (err) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('TARGET_FAILED', (err as Error).message);
+    }
+  }
+
+  // ------------------------------------------------------------------ simulation lab (chaos)
+  getChaos(node: NodeRef) {
+    return this.json<ChaosState>(node, '/internal/chaos', { method: 'GET' });
+  }
+
+  setChaos(node: NodeRef, patch: Partial<ChaosState>) {
+    return this.json<ChaosState>(node, '/internal/chaos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) });
+  }
+
+  corruptBlob(node: NodeRef, blobId: string) {
+    return this.json<{ ok: boolean }>(node, '/internal/chaos/corrupt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ blobId }) });
+  }
+}
+
+export interface ChaosState {
+  offline: boolean;
+  latencyMs: number;
+  errorRate: number;
+  diskFillPct: number;
 }

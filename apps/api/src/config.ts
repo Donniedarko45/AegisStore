@@ -23,6 +23,22 @@ const schema = z.object({
   /** per source IP + email per 15 minutes */
   LOGIN_RATE_LIMIT: envInt(10),
   COOKIE_SECURE: envBool(false),
+  /**
+   * Number of reverse proxies in front of the API (nginx = 1). Fastify then takes the client IP
+   * from the right place in X-Forwarded-For instead of trusting the left-most, client-supplied
+   * entry, which would let anyone spoof their IP past the login rate limit.
+   */
+  TRUST_PROXY_HOPS: envInt(1),
+  /** max downloads that may be buffered for verify-before-send at once (memory cap) */
+  VERIFY_BUFFER_CONCURRENCY: envInt(8),
+  /** multipart uploads (files larger than a single request allows) */
+  MULTIPART_MIN_PART_BYTES: envInt(5 * 1024 * 1024),
+  MULTIPART_MAX_PART_BYTES: envInt(100 * 1024 * 1024),
+  MAX_OBJECT_BYTES: envInt(5 * 1024 * 1024 * 1024),
+  MULTIPART_EXPIRY_HOURS: envInt(24),
+  /** signs share links; rotating it invalidates every link */
+  SIGNED_URL_SECRET: z.string().min(16).default('dev-signed-url-secret-change-me'),
+  SIGNED_URL_MAX_TTL_SEC: envInt(7 * 86_400),
   ALLOWED_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.string().default('info'),
 });

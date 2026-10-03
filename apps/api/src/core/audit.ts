@@ -10,7 +10,7 @@ export interface AuditEntry {
   resourceId?: string;
   metadata?: Record<string, unknown>;
   /** override the actor (used for system events and failed logins) */
-  actor?: { id?: string | null; type: 'USER' | 'API_KEY' | 'SYSTEM' | 'ANONYMOUS'; label?: string | null };
+  actor?: { id?: string | null; type: 'USER' | 'API_KEY' | 'SYSTEM' | 'ANONYMOUS' | 'SIGNED_URL'; label?: string | null };
 }
 
 /**

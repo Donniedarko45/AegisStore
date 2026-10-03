@@ -1,14 +1,15 @@
 import { hash, verify } from '@node-rs/argon2';
-import { eq, sessions, users } from '@aegis/db';
+import { and, desc, eq, gt, ne, sessions, sql, users } from '@aegis/db';
 import {
   AppError,
   SESSION_COOKIE,
+  changePasswordSchema,
   loginSchema,
   registerSchema,
   sha256Hex,
   type UserDto,
 } from '@aegis/shared';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AppContext } from '../context';
 import { audit } from '../core/audit';
 import { iso, isUniqueViolation, parse } from '../core/http';
@@ -66,7 +67,11 @@ export function authRoutes(app: FastifyInstance, ctx: AppContext) {
 
   app.post('/api/auth/login', async (req, reply) => {
     const body = parse(loginSchema, req.body);
-    if (!(await rateLimit(ctx.redis, `login:${req.ip}:${body.email}`, ctx.cfg.LOGIN_RATE_LIMIT, 900))) {
+    // per IP+email stops brute force on one account; the per-IP cap stops spraying across accounts
+    const allowed =
+      (await rateLimit(ctx.redis, `login:${req.ip}:${body.email}`, ctx.cfg.LOGIN_RATE_LIMIT, 900)) &&
+      (await rateLimit(ctx.redis, `login-ip:${req.ip}`, ctx.cfg.LOGIN_RATE_LIMIT * 5, 900));
+    if (!allowed) {
       throw new AppError(429, 'RATE_LIMITED', 'Too many login attempts, try again in a few minutes');
     }
     const [user] = await ctx.db.select().from(users).where(eq(users.email, body.email));
@@ -102,4 +107,69 @@ export function authRoutes(app: FastifyInstance, ctx: AppContext) {
   });
 
   app.get('/api/auth/me', async (req) => ({ user: toUserDto(requireUser(req).user) }));
+
+  const currentSessionHash = (req: FastifyRequest) => {
+    const token = req.cookies[SESSION_COOKIE];
+    return token ? sha256Hex(token) : null;
+  };
+  const requireSession = (req: FastifyRequest) => {
+    const p = requireUser(req);
+    // credential management needs an interactive session; a leaked API key must not escalate
+    if (p.kind !== 'USER') throw AppError.forbidden('Sign in with your password to manage credentials');
+    return p;
+  };
+
+  app.post('/api/auth/password', async (req) => {
+    const { user } = requireSession(req);
+    const body = parse(changePasswordSchema, req.body);
+    if (!(await rateLimit(ctx.redis, `pwchange:${user.id}`, 10, 900))) {
+      throw new AppError(429, 'RATE_LIMITED', 'Too many attempts, try again later');
+    }
+    const [row] = await ctx.db.select().from(users).where(eq(users.id, user.id));
+    if (!row || !(await verify(row.passwordHash, body.currentPassword).catch(() => false))) {
+      await audit(ctx, req, { action: 'auth.password_change_failed', resourceType: 'user', resourceId: user.id });
+      throw AppError.validation('Current password is incorrect');
+    }
+    await ctx.db.update(users).set({ passwordHash: await hash(body.newPassword) }).where(eq(users.id, user.id));
+    // every other session is signed out; the current one stays
+    const keep = currentSessionHash(req);
+    const revoked = await ctx.db
+      .delete(sessions)
+      .where(keep ? and(eq(sessions.userId, user.id), ne(sessions.tokenHash, keep)) : eq(sessions.userId, user.id))
+      .returning({ id: sessions.id });
+    await audit(ctx, req, { action: 'auth.password_change', resourceType: 'user', resourceId: user.id, metadata: { revokedSessions: revoked.length } });
+    return { ok: true, revokedSessions: revoked.length };
+  });
+
+  app.get('/api/auth/sessions', async (req) => {
+    const { user } = requireSession(req);
+    const current = currentSessionHash(req);
+    const rows = await ctx.db
+      .select()
+      .from(sessions)
+      .where(and(eq(sessions.userId, user.id), gt(sessions.expiresAt, sql`now()`)))
+      .orderBy(desc(sessions.lastUsedAt));
+    return {
+      items: rows.map((s) => ({
+        id: s.id,
+        ip: s.ip,
+        userAgent: s.userAgent,
+        createdAt: iso(s.createdAt),
+        lastUsedAt: iso(s.lastUsedAt),
+        expiresAt: iso(s.expiresAt),
+        current: s.tokenHash === current,
+      })),
+    };
+  });
+
+  app.delete<{ Params: { id: string } }>('/api/auth/sessions/:id', async (req) => {
+    const { user } = requireSession(req);
+    const deleted = await ctx.db
+      .delete(sessions)
+      .where(and(eq(sessions.id, req.params.id), eq(sessions.userId, user.id)))
+      .returning({ id: sessions.id });
+    if (!deleted.length) throw AppError.notFound('Session not found');
+    await audit(ctx, req, { action: 'auth.session_revoke', resourceType: 'session', resourceId: req.params.id });
+    return { ok: true };
+  });
 }

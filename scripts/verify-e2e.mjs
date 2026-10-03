@@ -232,7 +232,8 @@ check(`served by ${other}`, d.headers.get('x-aegis-served-by') === other, d.head
 r = await alice.get(`/api/buckets/${bucket}/objects?integrity=DEGRADED`);
 check('integrity filter finds the degraded object', r.data.items.some((i) => i.key === `fallback-${run}.txt`));
 r = await alice.get('/api/dashboard/summary');
-check('dashboard shows 2 healthy / 1 at-risk', r.data.nodes.healthy === 2 && r.data.nodes.atRisk === 1, JSON.stringify(r.data.nodes));
+// the others may be HEALTHY, WARNING or HIGH_RISK (a node that flapped recently is at risk but still serving)
+check('dashboard shows 1 node offline and 2 online', r.data.nodes.byStatus.OFFLINE === 1 && r.data.nodes.total - r.data.nodes.byStatus.OFFLINE === 2, JSON.stringify(r.data.nodes));
 r = await upload(alice, bucket, `during-outage-${run}.txt`, Buffer.from('written while a node is down'));
 check('uploads still succeed with 2 healthy nodes', r.status === 201 && !r.data.replicas.some((x) => x.node === victim));
 
@@ -276,7 +277,9 @@ if (existsSync(RUNTIME)) {
   check('every download returned correct bytes despite a corrupt replica', allGood);
   check('corrupt replica was detected and marked CORRUPT', flagged);
   const after = (await alice.get(`/api/buckets/${bucket}/object/details?key=${q(ckey)}`)).data;
-  check('integrity now DEGRADED and the bad replica shows a checksum mismatch', after.current.integrity === 'DEGRADED' && !after.replicas.find((y) => y.id === bad.id).checksumMatch);
+  // self-healing may already have rewritten the bad copy; either way it must never look healthy while corrupt
+  const badNow = after.replicas.find((y) => y.id === bad.id);
+  check('bad replica is reported as a mismatch until it is repaired', badNow.state === 'CORRUPT' ? !badNow.checksumMatch && after.current.integrity === 'DEGRADED' : badNow.checksumMatch);
 } else {
   console.log('  - (skipped: RUNTIME_DIR not found)');
 }
@@ -336,6 +339,8 @@ r = await bob.del(objUrl(bucket, `fallback-${run}.txt`));
 check('WRITE user can delete an object', r.status === 200);
 d = await download(alice, bucket, `fallback-${run}.txt`);
 check('deleted object -> 404', d.status === 404);
+r = await bob.del(`/api/buckets/${bucket}`);
+check('a WRITE grantee cannot delete the bucket', r.status === 403, String(r.status));
 r = await alice.del(`/api/buckets/${bucket}`);
 check('non-empty bucket cannot be deleted (409)', r.status === 409 && r.data.error.code === 'BUCKET_NOT_EMPTY');
 const left = (await alice.get(`/api/buckets/${bucket}/objects?pageSize=200`)).data.items;
@@ -366,6 +371,110 @@ check('node list has ring share summing to ~100%', Math.abs(r.data.items.reduce(
 const nid = r.data.items[0].id;
 r = await alice.get(`/api/nodes/${nid}`);
 check('node details return metrics history', r.status === 200 && Array.isArray(r.data.history));
+
+section('12. Restore & recently deleted');
+const rb = `restore-${run}`;
+await alice.post('/api/buckets', { name: rb });
+await upload(alice, rb, 'doc.txt', Buffer.from('version one'));
+await upload(alice, rb, 'doc.txt', Buffer.from('version two'));
+let det = (await alice.get(`/api/buckets/${rb}/object/details?key=doc.txt`)).data;
+const v1 = det.versions.find((v) => v.versionNo === 1);
+check('overwrite (unversioned) keeps v1 as DELETED with a purge date', v1?.state === 'DELETED' && !!v1.purgeAfter, JSON.stringify(v1));
+check('details expose ring placement', typeof det.placement?.ringPos === 'number' && det.placement.ringPos >= 0 && det.placement.ringPos < 1 && det.placement.ringOrder.length >= 3);
+r = await alice.post(`/api/buckets/${rb}/object/restore?key=doc.txt&versionId=${v1.versionId}`);
+check('restore an overwritten version', r.status === 200 && r.data.versionNo === 3, JSON.stringify(r.data));
+d = await download(alice, rb, 'doc.txt');
+check('download serves the restored bytes', d.buf.toString() === 'version one');
+det = (await alice.get(`/api/buckets/${rb}/object/details?key=doc.txt`)).data;
+check('restored version reuses the blob (replicas still verified)', det.replicas.length === 2 && det.replicas.every((x) => x.checksumMatch));
+r = await alice.post(`/api/buckets/${rb}/object/restore?key=doc.txt&versionId=${det.current.versionId}`);
+check('restoring the current version is rejected (409)', r.status === 409);
+await alice.del(objUrl(rb, 'doc.txt'));
+r = await alice.get(`/api/buckets/${rb}/objects/deleted`);
+const gone = r.data.items.find((i) => i.key === 'doc.txt');
+check('deleted object appears in "recently deleted"', !!gone && !!gone.purgeAfter);
+r = await alice.post(`/api/buckets/${rb}/object/restore?key=doc.txt&versionId=${gone.versionId}`);
+check('undo delete restores it', r.status === 200);
+d = await download(alice, rb, 'doc.txt');
+check('undeleted object downloads again', d.status === 200 && d.buf.toString() === 'version one');
+r = await bob.post(`/api/buckets/${rb}/object/restore?key=doc.txt&versionId=${gone.versionId}`);
+check('users without access cannot restore (404)', r.status === 404);
+
+section('13. Password & sessions');
+const carol = new Client('carol');
+const carolEmail = `carol-${run}@example.com`;
+await carol.post('/api/auth/register', { email: carolEmail, password: 'carol-password-1' });
+const carol2 = new Client('carol-second-device');
+await carol2.post('/api/auth/login', { email: carolEmail, password: 'carol-password-1' });
+r = await carol.get('/api/auth/sessions');
+check('sessions list shows both devices, one marked current', r.data.items.length === 2 && r.data.items.filter((x) => x.current).length === 1);
+r = await carol.post('/api/auth/password', { currentPassword: 'wrong', newPassword: 'carol-password-2' });
+check('wrong current password is rejected', r.status === 400);
+r = await carol.post('/api/auth/password', { currentPassword: 'carol-password-1', newPassword: 'carol-password-2' });
+check('password change succeeds and revokes the other session', r.status === 200 && r.data.revokedSessions === 1);
+check('current session survives the change', (await carol.get('/api/auth/me')).status === 200);
+check('other device is signed out (401)', (await carol2.get('/api/auth/me')).status === 401);
+check('old password no longer works', (await new Client('x').post('/api/auth/login', { email: carolEmail, password: 'carol-password-1' })).status === 401);
+check('new password works', (await new Client('y').post('/api/auth/login', { email: carolEmail, password: 'carol-password-2' })).status === 200);
+
+section('14. User administration');
+r = await alice.get('/api/users');
+check('members cannot list users (403)', r.status === 403);
+r = await admin.get('/api/users');
+const bobRow = r.data.items.find((u) => u.email === `bob-${run}@example.com`);
+check('admin lists users with usage stats', r.status === 200 && !!bobRow && typeof bobRow.bytes === 'number');
+const me = (await admin.get('/api/auth/me')).data.user;
+r = await admin.req('PATCH', `/api/users/${me.id}`, { json: { role: 'MEMBER' } });
+check('admins cannot demote themselves (403)', r.status === 403);
+r = await admin.req('PATCH', `/api/users/${bobRow.id}`, { json: { status: 'DISABLED' } });
+check('admin disables a user', r.status === 200);
+check('disabled user is signed out immediately (401)', (await bob.get('/api/auth/me')).status === 401);
+check('disabled user cannot sign in', (await bob.post('/api/auth/login', { email: `bob-${run}@example.com`, password: 'bob-password-1' })).status === 401);
+await admin.req('PATCH', `/api/users/${bobRow.id}`, { json: { status: 'ACTIVE' } });
+check('re-enabled user can sign in again', (await bob.post('/api/auth/login', { email: `bob-${run}@example.com`, password: 'bob-password-1' })).status === 200);
+
+section('15. Analytics, ring, uptime, system');
+r = await alice.get('/api/analytics/overview?range=1h');
+check('analytics: gap-filled activity series', r.status === 200 && r.data.activity.length >= 59 && r.data.totals.uploads > 0, `${r.data.activity?.length} points, ${r.data.totals?.uploads} uploads`);
+check('analytics: storage, breakdowns and histogram present', r.data.storage.length >= 59 && Array.isArray(r.data.byType) && r.data.sizeHistogram.length === 5 && typeof r.data.integrity.healthy === 'number');
+r = await alice.get('/api/nodes/ring');
+check('ring: 3 x 128 virtual nodes, shares sum to ~100%', r.data.points.length === 384 && Math.abs(r.data.nodes.reduce((a, n) => a + n.sharePct, 0) - 100) < 1);
+r = await alice.get('/api/nodes/uptime?range=1h');
+const withIncident = r.data.nodes.find((n) => n.incidents.length > 0);
+check('uptime: bars per node and the earlier outages recorded as incidents', r.data.nodes.length >= 3 && r.data.nodes[0].bars.length === 60 && !!withIncident, JSON.stringify(r.data.nodes.map((n) => [n.name, n.uptimePct, n.incidents.length])));
+r = await alice.get('/api/nodes/metrics?range=1h');
+check('metrics: per-node series', r.status === 200 && r.data.nodes.length >= 3 && Array.isArray(r.data.latencyP95));
+r = await alice.get('/api/system');
+check('system info reports components and config', r.data.components.database === 'up' && r.data.config.replicationFactor === 2);
+
+section('16. Live events (SSE)');
+{
+  const ctl = new AbortController();
+  const res = await fetch(`${API}/api/events/stream`, { headers: { cookie: alice.cookie }, signal: ctl.signal });
+  check('event stream opens as text/event-stream', res.status === 200 && (res.headers.get('content-type') ?? '').startsWith('text/event-stream'));
+  const seen = new Set();
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        for (const m of buf.matchAll(/^event: (\S+)$/gm)) seen.add(m[1]);
+      }
+    } catch { /* aborted */ }
+  })();
+  await sleep(400);
+  await upload(alice, rb, 'live.txt', Buffer.from('live'));
+  await waitFor('node.metrics and object.created events', async () => seen.has('node.metrics') && seen.has('object.created'), 15_000, 250).catch(() => null);
+  check('receives ready, live node metrics and object events', seen.has('ready') && seen.has('node.metrics') && seen.has('object.created'), [...seen].join(','));
+  ctl.abort();
+  await pump;
+  const anonSse = await fetch(`${API}/api/events/stream`);
+  check('event stream requires authentication (401)', anonSse.status === 401);
+}
 
 // ---------------------------------------------------------------------------------------------
 console.log(`\n${failures.length === 0 ? 'ALL CHECKS PASSED' : 'FAILED'}  (${passed} passed, ${failures.length} failed)`);
