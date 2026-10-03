@@ -8,6 +8,7 @@ export { schema };
 export * from 'drizzle-orm';
 
 export type Db = ReturnType<typeof createDb>['db'];
+export type Pool = pg.Pool;
 
 // Return BIGINT (int8) columns as JS numbers; object sizes stay far below 2^53.
 pg.types.setTypeParser(20, (v) => Number(v));
