@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream';
-import { and, desc, eq, inArray, objectVersions, objects, replicas, sql, storageNodes, users } from '@aegis/db';
+import { and, desc, eq, inArray, notInArray, objectVersions, objects, replicas, sql, storageNodes, users } from '@aegis/db';
 import {
   AppError,
   listObjectsQuerySchema,
@@ -482,7 +482,8 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
   const versionId = randomUUID();
   const blobId = randomUUID();
 
-  const nodes = await pickNodes(ctx.db, `${bucket.id}/${key}@${versionId}`, {
+  const placementKey = `${bucket.id}/${key}@${versionId}`;
+  const nodes = await pickNodes(ctx.db, placementKey, {
     replicas: wanted,
     vnodes: ctx.cfg.VNODES_PER_NODE,
     offlineAfterMs: ctx.cfg.OFFLINE_AFTER_MS,
@@ -526,49 +527,98 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     await ctx.db.delete(objectVersions).where(eq(objectVersions.id, versionId)).catch(() => undefined);
   };
 
-  // 2. stream to every replica node while hashing once
+  // 2. stream to every replica node while hashing once. A node that fails mid-stream is dropped;
+  //    the upload carries on as long as one copy is still being written.
   const sinks = nodes.map((n) => ctx.storage.startStage(n, blobId, { requestId: req.id, expectedSize }));
-  let stats: { sha256: string; size: number };
+  let stats: Awaited<ReturnType<typeof fanoutStage>>;
   try {
-    stats = await fanoutStage(req.raw, sinks, { maxBytes: ctx.cfg.MAX_UPLOAD_BYTES });
+    stats = await fanoutStage(req.raw, sinks, { maxBytes: ctx.cfg.MAX_UPLOAD_BYTES, minSinks: 1 });
   } catch (err) {
     await discard();
     if (err instanceof AppError) throw err;
     throw new AppError(502, 'UPLOAD_FAILED', `Upload failed while streaming to storage nodes: ${(err as Error).message}`);
   }
 
-  // 3. every node must report exactly the bytes we sent
+  // 3. every surviving node must report exactly the bytes we sent
   const settled = await Promise.allSettled(sinks.map((s) => s.result));
-  const staged = settled.map((s) => (s.status === 'fulfilled' ? s.value : null));
-  const abortStaged = () =>
-    Promise.allSettled(staged.map((s, i) => (s ? ctx.storage.abort(nodes[i]!, blobId, s.stagedToken) : undefined)));
-
-  const failed = settled.flatMap((s, i) => (s.status === 'rejected' ? [`${nodes[i]!.name}: ${(s.reason as Error).message}`] : []));
-  if (failed.length) {
-    await abortStaged();
-    await discard();
-    throw new AppError(502, 'UPLOAD_FAILED', `Storage node error: ${failed.join('; ')}`);
+  const good: { node: NodeRow; staged: StagedResult }[] = [];
+  const lost: { node: NodeRow; reason: string }[] = [];
+  const mismatched: string[] = [];
+  for (const [i, s] of settled.entries()) {
+    const node = nodes[i]!;
+    const dropped = stats.failed.find((f) => f.sink === sinks[i]);
+    if (dropped || s.status === 'rejected') {
+      lost.push({ node, reason: (dropped?.error ?? (s as PromiseRejectedResult).reason as Error).message });
+    } else if (s.value.sha256 !== stats.sha256 || s.value.size !== stats.size) {
+      mismatched.push(node.name);
+      lost.push({ node, reason: 'checksum mismatch' });
+      await ctx.storage.abort(node, blobId, s.value.stagedToken);
+    } else good.push({ node, staged: s.value });
   }
-  const mismatched = staged.flatMap((s, i) => (s && (s.sha256 !== stats.sha256 || s.size !== stats.size) ? [nodes[i]!.name] : []));
   if (mismatched.length) {
-    await abortStaged();
-    await discard();
     await audit(ctx, req, { action: 'object.upload_checksum_mismatch', resourceType: 'object', resourceId: objectId, metadata: { bucket: bucket.name, key, nodes: mismatched } });
-    throw new AppError(502, 'CHECKSUM_MISMATCH', `Checksum mismatch on ${mismatched.join(', ')}; nothing was stored. Please retry.`);
   }
 
-  // 4. commit on every node (atomic rename); all-or-nothing
-  const committed = await Promise.allSettled(nodes.map((n, i) => ctx.storage.commit(n, blobId, (staged[i] as StagedResult).stagedToken, req.id)));
-  const commitFailures = committed.flatMap((c, i) => (c.status === 'rejected' ? [i] : []));
-  if (commitFailures.length) {
-    await Promise.allSettled(
-      nodes.map((n, i) => (commitFailures.includes(i) ? ctx.storage.abort(n, blobId, (staged[i] as StagedResult).stagedToken) : ctx.storage.deleteBlob(n, blobId))),
-    );
+  // 4. commit on the good nodes (atomic rename)
+  const holders: { node: NodeRow; path: string; fallbackFor?: string }[] = [];
+  const committed = await Promise.allSettled(good.map((g) => ctx.storage.commit(g.node, blobId, g.staged.stagedToken, req.id)));
+  for (const [i, c] of committed.entries()) {
+    const g = good[i]!;
+    if (c.status === 'fulfilled') holders.push({ node: g.node, path: c.value.path });
+    else {
+      lost.push({ node: g.node, reason: `commit failed: ${(c.reason as Error).message}` });
+      await ctx.storage.abort(g.node, blobId, g.staged.stagedToken);
+    }
+  }
+  const rollback = async () => {
+    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
     await discard();
-    throw new AppError(502, 'UPLOAD_FAILED', `Commit failed on ${commitFailures.map((i) => nodes[i]!.name).join(', ')}; nothing was stored.`);
+  };
+  if (!holders.length) {
+    await discard();
+    if (mismatched.length) throw new AppError(502, 'CHECKSUM_MISMATCH', `Checksum mismatch on ${mismatched.join(', ')}; nothing was stored. Please retry.`);
+    throw new AppError(502, 'UPLOAD_FAILED', `Storage node error: ${lost.map((l) => `${l.node.name}: ${l.reason}`).join('; ')}`);
+  }
+
+  // 4b. replace lost copies: the next eligible node clockwise on the ring receives a verified copy
+  //     of a committed replica (node -> API -> node, hashed in flight), so the upload still ends
+  //     with R verified replicas instead of failing.
+  const tried = new Set(nodes.map((n) => n.id));
+  for (const l of lost) {
+    if (holders.length >= wanted) break;
+    let replaced = false;
+    while (!replaced) {
+      const [next] = await pickNodes(ctx.db, placementKey, {
+        replicas: 1,
+        vnodes: ctx.cfg.VNODES_PER_NODE,
+        offlineAfterMs: ctx.cfg.OFFLINE_AFTER_MS,
+        expectedSize: stats.size,
+        exclude: tried,
+      });
+      if (!next) break;
+      tried.add(next.id);
+      await ctx.db.insert(replicas).values({ versionId, nodeId: next.id, blobPath, state: 'PENDING' }).onConflictDoNothing();
+      try {
+        const c = await ctx.storage.copyBlob(holders[0]!.node, next, blobId, { sha256: stats.sha256, size: stats.size }, req.id);
+        holders.push({ node: next, path: c.path, fallbackFor: l.node.name });
+        replaced = true;
+        req.log.warn({ failed: l.node.name, replacement: next.name, reason: l.reason }, 'upload fell back to the next ring node');
+      } catch (err) {
+        req.log.warn({ node: next.name, err: (err as Error).message }, 'fallback copy failed; trying the next node');
+      }
+    }
+  }
+  if (holders.length < wanted) {
+    await rollback();
+    throw new AppError(
+      502,
+      'UPLOAD_FAILED',
+      `Only ${holders.length} of ${wanted} copies could be stored (${lost.map((l) => `${l.node.name}: ${l.reason}`).join('; ')}); nothing was kept. Please retry.`,
+    );
   }
 
   // 5. make it visible atomically
+  const holderIds = holders.map((h) => h.node.id);
   const retention = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
   const finalized = await ctx.db.transaction(async (tx) => {
     // Only a still-PENDING version may be activated. If the GC already reaped it (an upload that
@@ -582,7 +632,8 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     await tx
       .update(replicas)
       .set({ state: 'HEALTHY', sha256: stats.sha256, lastVerifiedAt: new Date() })
-      .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, nodes.map((n) => n.id))));
+      .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, holderIds)));
+    await tx.delete(replicas).where(and(eq(replicas.versionId, versionId), notInArray(replicas.nodeId, holderIds)));
     const [locked] = await tx.select().from(objects).where(eq(objects.id, objectId)).for('update');
     if (locked?.currentVersionId && !bucket.versioningEnabled) {
       // overwrite without versioning: the old bytes stay recoverable until the retention purge
@@ -595,15 +646,16 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     return true;
   });
   if (!finalized) {
-    await Promise.allSettled(nodes.map((n) => ctx.storage.deleteBlob(n, blobId)));
+    await Promise.allSettled(holders.map((h) => ctx.storage.deleteBlob(h.node, blobId)));
     throw new AppError(502, 'UPLOAD_FAILED', 'Upload took too long and was cleaned up as abandoned; please retry.');
   }
+  const fallback = holders.filter((h) => h.fallbackFor).map((h) => ({ failed: h.fallbackFor, replacement: h.node.name }));
 
   await audit(ctx, req, {
     action: 'object.upload',
     resourceType: 'object',
     resourceId: objectId,
-    metadata: { bucket: bucket.name, key, size: stats.size, sha256: stats.sha256, versionNo, nodes: nodes.map((n) => n.name) },
+    metadata: { bucket: bucket.name, key, size: stats.size, sha256: stats.sha256, versionNo, nodes: holders.map((h) => h.node.name), ...(fallback.length && { fallback }) },
   });
   void publishEvent(ctx.redis, 'object.created', { bucket: bucket.name, key, size: stats.size });
 
@@ -614,7 +666,7 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
     size: stats.size,
     sha256: stats.sha256,
     contentType,
-    replicas: nodes.map((n, i) => ({ node: n.name, path: (committed[i] as PromiseFulfilledResult<{ path: string }>).value.path })),
+    replicas: holders.map((h) => ({ node: h.node.name, path: h.path, ...(h.fallbackFor && { fallbackFor: h.fallbackFor }) })),
   };
 }
 

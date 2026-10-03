@@ -1,5 +1,6 @@
 import { Agent as HttpAgent, request as httpRequest } from 'node:http';
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 
 export interface NodeRef {
@@ -33,6 +34,16 @@ export interface StageSink {
 export class NodeHttpError extends Error {
   constructor(
     public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Why a node-to-node copy failed, so callers can react (flag the source vs. retry elsewhere). */
+export class CopyError extends Error {
+  constructor(
+    public readonly kind: 'SOURCE_UNAVAILABLE' | 'SOURCE_MISSING' | 'SOURCE_CORRUPT' | 'TARGET_FAILED' | 'TARGET_MISMATCH',
     message: string,
   ) {
     super(message);
@@ -184,6 +195,68 @@ export class StorageClient {
       };
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Copy one committed blob from `from` to `to` through this process (constant memory, honours
+   * backpressure). The bytes are hashed in flight and must match `expectedSha256` both here and on
+   * the target before the target commits, so a copy can never spread corruption.
+   */
+  async copyBlob(
+    from: NodeRef,
+    to: NodeRef,
+    blobId: string,
+    expected: { sha256: string; size: number },
+    requestId?: string,
+  ): Promise<{ size: number; path: string }> {
+    let src;
+    try {
+      src = await this.openBlob(from, blobId, requestId);
+    } catch (err) {
+      throw new CopyError('SOURCE_UNAVAILABLE', `${from.name}: ${(err as Error).message}`);
+    }
+    if (src.status === 404) throw new CopyError('SOURCE_MISSING', `${from.name}: blob missing`);
+    if (!src.stream) throw new CopyError('SOURCE_UNAVAILABLE', `${from.name}: HTTP ${src.status}`);
+
+    const sink = this.startStage(to, blobId, { requestId, expectedSize: expected.size });
+    const hash = createHash('sha256');
+    let size = 0;
+    try {
+      for await (const chunk of src.stream) {
+        const buf = chunk as Buffer;
+        hash.update(buf);
+        size += buf.length;
+        if (sink.failed) throw sink.failed;
+        if (!sink.write(buf)) await Promise.race([sink.drained(), sink.errored]);
+      }
+      sink.end();
+    } catch (err) {
+      sink.destroy(err as Error);
+      src.stream.destroy();
+      throw new CopyError('TARGET_FAILED', `${to.name}: ${(err as Error).message}`);
+    }
+    let staged: StagedResult;
+    try {
+      staged = await sink.result;
+    } catch (err) {
+      throw new CopyError('TARGET_FAILED', (err as Error).message);
+    }
+    const actual = hash.digest('hex');
+    if (actual !== expected.sha256 || size !== expected.size) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('SOURCE_CORRUPT', `${from.name}: source bytes do not match the recorded checksum`);
+    }
+    if (staged.sha256 !== expected.sha256 || staged.size !== expected.size) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('TARGET_MISMATCH', `${to.name}: staged checksum mismatch`);
+    }
+    try {
+      const c = await this.commit(to, blobId, staged.stagedToken, requestId);
+      return { size: c.size, path: c.path };
+    } catch (err) {
+      await this.abort(to, blobId, staged.stagedToken);
+      throw new CopyError('TARGET_FAILED', (err as Error).message);
     }
   }
 }

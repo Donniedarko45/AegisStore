@@ -164,6 +164,13 @@ export const storageNodes = pgTable('storage_nodes', {
   probationBeats: integer('probation_beats').notNull().default(0),
   lastMetrics: jsonb('last_metrics').$type<NodeMetrics>(),
   vnodeCount: integer('vnode_count').notNull().default(128),
+  /** administrator asked to evacuate this node; survives OFFLINE -> back online */
+  draining: boolean('draining').notNull().default(false),
+  /** latest risk explanation: signals, contributions, disk ETA (see @aegis/shared risk.ts) */
+  riskFactors: jsonb('risk_factors').$type<Record<string, unknown>>(),
+  /** smoothed (EWMA) inputs carried between scorer ticks */
+  riskState: jsonb('risk_state').$type<Record<string, number>>(),
+  riskUpdatedAt: timestamp('risk_updated_at', { withTimezone: true }),
   statusChangedAt: timestamp('status_changed_at', { withTimezone: true }).notNull().defaultNow(),
   registeredAt: createdAt(),
 });
@@ -201,8 +208,46 @@ export const nodeMetrics = pgTable(
     errorRate: real('error_rate').notNull(),
     blobCount: integer('blob_count').notNull(),
     probeMs: real('probe_ms').notNull().default(0),
+    riskScore: real('risk_score').notNull().default(0),
+    uptimeSec: real('uptime_sec').notNull().default(0),
   },
   (t) => [index('node_metrics_node_ts_idx').on(t.nodeId, t.ts)],
+);
+
+// ---------------------------------------------------------------- background jobs
+/**
+ * Durable work queue in Postgres (Redis stays disposable). Workers claim rows with
+ * FOR UPDATE SKIP LOCKED; `dedupe_key` is unique among QUEUED/RUNNING jobs so the reconciler can
+ * re-derive work every tick without enqueuing duplicates.
+ */
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: id(),
+    /** REPAIR_REPLICA | TRIM_REPLICA | VERIFY_REPLICA */
+    type: text('type').notNull(),
+    /** QUEUED | RUNNING | DONE | FAILED | CANCELLED */
+    status: text('status').notNull().default('QUEUED'),
+    /** lower runs first */
+    priority: integer('priority').notNull().default(100),
+    dedupeKey: text('dedupe_key'),
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+    result: jsonb('result').$type<Record<string, unknown>>(),
+    reason: text('reason'),
+    attempts: integer('attempts').notNull().default(0),
+    maxAttempts: integer('max_attempts').notNull().default(5),
+    runAfter: timestamp('run_after', { withTimezone: true }).notNull().defaultNow(),
+    lastError: text('last_error'),
+    bytes: bytes('bytes').notNull().default(0),
+    createdAt: createdAt(),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('jobs_dedupe_active_uq').on(t.dedupeKey).where(sql`${t.status} IN ('QUEUED', 'RUNNING')`),
+    index('jobs_claim_idx').on(t.status, t.priority, t.runAfter),
+    index('jobs_created_idx').on(t.createdAt),
+  ],
 );
 
 // ---------------------------------------------------------------- ops

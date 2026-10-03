@@ -1,4 +1,5 @@
 import type { IntegrityStatus, NodeStatus, Permission, StorageClass, UserRole } from './constants';
+import type { RiskFactor } from './risk';
 
 /** Metrics a storage node reports in each heartbeat */
 export interface NodeMetrics {
@@ -82,4 +83,17 @@ export interface NodeDto {
   lastHeartbeatAt: string | null;
   ringSharePct: number;
   metrics: NodeMetrics | null;
+  draining: boolean;
+  statusChangedAt: string | null;
+  risk: NodeRiskDto | null;
+}
+
+/** Why a node has the risk score it has (written by the worker's risk scorer). */
+export interface NodeRiskDto {
+  signals: Record<RiskFactor, number>;
+  contributions: Record<RiskFactor, number>;
+  top: RiskFactor | null;
+  diskFullEtaHours: number | null;
+  inputs: Record<string, number>;
+  updatedAt: string | null;
 }

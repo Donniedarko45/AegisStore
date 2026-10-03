@@ -1,5 +1,5 @@
 import { desc, eq, nodeMetrics, replicas, sql, storageNodes } from '@aegis/db';
-import { AppError, HeartbeatBodyGuard, type NodeDto } from '@aegis/shared';
+import { AppError, HeartbeatBodyGuard, type NodeDto, type NodeStatus } from '@aegis/shared';
 import { timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../context';
@@ -9,7 +9,7 @@ import { RANGES, rangeOf } from '../core/visibility';
 import { HashRing } from '@aegis/hashring';
 import { ringFor } from '../core/placement';
 import { publishEvent } from '../core/redis';
-import { requireUser } from '../plugins/auth';
+import { requireSiteAdmin, requireUser } from '../plugins/auth';
 
 export async function listNodeDtos(ctx: AppContext): Promise<NodeDto[]> {
   const nodes = await ctx.db.select().from(storageNodes).orderBy(storageNodes.name);
@@ -26,6 +26,9 @@ export async function listNodeDtos(ctx: AppContext): Promise<NodeDto[]> {
     lastHeartbeatAt: iso(n.lastHeartbeatAt),
     ringSharePct: Math.round((shares.get(n.id) ?? 0) * 1000) / 10,
     metrics: n.lastMetrics ?? null,
+    draining: n.draining,
+    statusChangedAt: iso(n.statusChangedAt),
+    risk: n.riskFactors ? ({ ...(n.riskFactors as object), updatedAt: iso(n.riskUpdatedAt) } as NodeDto['risk']) : null,
   }));
 }
 
@@ -145,6 +148,55 @@ export function nodeRoutes(app: FastifyInstance, ctx: AppContext) {
     };
   });
 
+  // Evacuate a node: no new writes, and the self-healing worker migrates every replica away.
+  app.post<{ Params: { id: string } }>('/api/nodes/:id/drain', async (req) => {
+    requireSiteAdmin(req);
+    const [n] = await ctx.db
+      .update(storageNodes)
+      .set({ draining: true, status: sql`CASE WHEN ${storageNodes.status} = 'OFFLINE' THEN 'OFFLINE' ELSE 'DRAINING' END`, statusChangedAt: sql`now()` })
+      .where(eq(storageNodes.id, req.params.id))
+      .returning();
+    if (!n) throw AppError.notFound('Node not found');
+    await audit(ctx, req, { action: 'node.drain', resourceType: 'node', resourceId: n.id, metadata: { name: n.name } });
+    void publishEvent(ctx.redis, 'node.status', { name: n.name, status: n.status });
+    return { ok: true, status: n.status };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/nodes/:id/undrain', async (req) => {
+    requireSiteAdmin(req);
+    const [n] = await ctx.db
+      .update(storageNodes)
+      .set({ draining: false, status: sql`CASE WHEN ${storageNodes.status} = 'DRAINING' THEN 'HEALTHY' ELSE ${storageNodes.status} END`, statusChangedAt: sql`now()` })
+      .where(eq(storageNodes.id, req.params.id))
+      .returning();
+    if (!n) throw AppError.notFound('Node not found');
+    await audit(ctx, req, { action: 'node.undrain', resourceType: 'node', resourceId: n.id, metadata: { name: n.name } });
+    void publishEvent(ctx.redis, 'node.status', { name: n.name, status: n.status });
+    return { ok: true, status: n.status };
+  });
+
+  // Risk score history (rolled up with the metrics) for the risk chart.
+  app.get<{ Querystring: { range?: string } }>('/api/nodes/risk', async (req) => {
+    requireUser(req);
+    const range = rangeOf(req.query.range ?? '1h');
+    const { interval, step } = RANGES[range];
+    const rows = rowsOf<{ t: Date; name: string; risk: number }>(
+      await ctx.db.execute(sql`
+        SELECT date_bin(${step}::interval, m.ts, 'epoch'::timestamptz) AS t, n.name, max(m.risk_score)::real AS risk
+          FROM node_metrics m JOIN storage_nodes n ON n.id = m.node_id
+         WHERE m.ts >= now() - ${interval}::interval
+         GROUP BY 1, 2 ORDER BY 1`),
+    );
+    const byT = new Map<string, Record<string, number | string>>();
+    for (const r of rows) {
+      const t = iso(r.t)!;
+      const row = byT.get(t) ?? { t };
+      row[r.name] = Math.round(Number(r.risk) * 1000) / 1000;
+      byT.set(t, row);
+    }
+    return { range, step, nodes: [...new Set(rows.map((r) => r.name))].sort(), series: [...byT.values()] };
+  });
+
   app.get<{ Params: { id: string } }>('/api/nodes/:id', async (req) => {
     requireUser(req);
     const dto = (await listNodeDtos(ctx)).find((n) => n.id === req.params.id);
@@ -208,34 +260,33 @@ export function internalRoutes(app: FastifyInstance, ctx: AppContext) {
       return { ok: true, status: 'HEALTHY' };
     }
 
-    // A node that was OFFLINE must send PROBATION_BEATS consecutive heartbeats before it is trusted again.
-    let status = existing.status;
-    let probation = 0;
-    if (existing.status === 'OFFLINE') {
-      probation = existing.probationBeats + 1;
-      if (probation >= ctx.cfg.PROBATION_BEATS) {
-        status = 'HEALTHY';
-        probation = 0;
-      }
-    }
-    await ctx.db
-      .update(storageNodes)
-      .set({
-        baseUrl: hb.baseUrl,
-        status,
-        probationBeats: probation,
-        capacityBytes: hb.metrics.diskCapacityBytes,
-        usedBytes: hb.metrics.diskUsedBytes,
-        blobCount: hb.metrics.blobCount,
-        lastHeartbeatAt: now,
-        lastMetrics: hb.metrics,
-        ...(status !== existing.status && { statusChangedAt: sql`now()` }),
-      })
-      .where(eq(storageNodes.id, existing.id));
+    // A node that was OFFLINE must send PROBATION_BEATS consecutive heartbeats before it is trusted
+    // again (back to DRAINING if an administrator is evacuating it). Every other status is owned by
+    // someone else (risk scorer, administrator), so it is never written back from here: the
+    // transition is computed in one atomic UPDATE instead of read-modify-write.
+    const [res] = rowsOf<{ status: NodeStatus; previous: NodeStatus }>(
+      await ctx.db.execute(sql`
+        WITH prev AS (SELECT id, status FROM storage_nodes WHERE id = ${existing.id} FOR UPDATE)
+        UPDATE storage_nodes s
+           SET base_url = ${hb.baseUrl},
+               capacity_bytes = ${hb.metrics.diskCapacityBytes},
+               used_bytes = ${hb.metrics.diskUsedBytes},
+               blob_count = ${hb.metrics.blobCount},
+               last_heartbeat_at = now(),
+               last_metrics = ${JSON.stringify(hb.metrics)}::jsonb,
+               probation_beats = CASE WHEN prev.status = 'OFFLINE' AND s.probation_beats + 1 < ${ctx.cfg.PROBATION_BEATS} THEN s.probation_beats + 1 ELSE 0 END,
+               status = CASE WHEN prev.status = 'OFFLINE' AND s.probation_beats + 1 >= ${ctx.cfg.PROBATION_BEATS}
+                             THEN CASE WHEN s.draining THEN 'DRAINING' ELSE 'HEALTHY' END
+                             ELSE s.status END,
+               status_changed_at = CASE WHEN prev.status = 'OFFLINE' AND s.probation_beats + 1 >= ${ctx.cfg.PROBATION_BEATS} THEN now() ELSE s.status_changed_at END
+          FROM prev WHERE s.id = prev.id
+        RETURNING s.status, prev.status AS previous`),
+    );
+    const status = res?.status ?? existing.status;
 
     void publishEvent(ctx.redis, 'node.metrics', { id: existing.id, name: hb.name, status, metrics: hb.metrics });
-    if (status !== existing.status) {
-      await audit(ctx, null, { action: 'node.online', resourceType: 'node', resourceId: existing.id, metadata: { name: hb.name, from: existing.status, to: status }, actor: { type: 'SYSTEM', label: hb.name } });
+    if (res && res.status !== res.previous) {
+      await audit(ctx, null, { action: 'node.online', resourceType: 'node', resourceId: existing.id, metadata: { name: hb.name, from: res.previous, to: status }, actor: { type: 'SYSTEM', label: hb.name } });
       void publishEvent(ctx.redis, 'node.status', { name: hb.name, status });
     }
     return { ok: true, status };

@@ -8,7 +8,10 @@ import { runGc } from './jobs/gc';
 import { sweepNodeHealth } from './jobs/health-sweeper';
 import { rollupMetrics } from './jobs/metrics-rollup';
 import { purgeExpired } from './jobs/retention-purge';
+import { JobRunner, reconcile, scrub } from './jobs/healing';
+import { scoreNodes } from './jobs/risk-scorer';
 import { becomeLeader } from './leader';
+import type { WorkerCtx } from './util';
 
 const cfg = loadConfig();
 const log = pino({ level: cfg.LOG_LEVEL, base: { svc: 'worker' } });
@@ -68,9 +71,17 @@ const leader = await becomeLeader(pool, log, abort.signal, (err) => {
   process.exit(1);
 });
 if (leader) {
+  const ctx: WorkerCtx = { db, redis, log };
+  const heal = { offlineAfterMs: cfg.OFFLINE_AFTER_MS, healGraceMs: cfg.HEAL_GRACE_MS, vnodes: cfg.VNODES_PER_NODE };
+  const runner = new JobRunner(ctx, storage, { ...heal, concurrency: cfg.REPAIR_CONCURRENCY });
+  await runner.recover();
   every('health-sweeper', cfg.SWEEP_INTERVAL_MS, () => sweepNodeHealth(db, redis, log, cfg.OFFLINE_AFTER_MS));
   every('metrics-rollup', cfg.METRICS_ROLLUP_INTERVAL_MS, () => rollupMetrics(db));
   every('gc', cfg.GC_INTERVAL_MS, () => runGc(db, storage, log, cfg.METRICS_RETENTION_DAYS));
   every('retention-purge', cfg.PURGE_INTERVAL_MS, () => purgeExpired(db, storage, log));
+  every('risk-scorer', cfg.RISK_INTERVAL_MS, () => scoreNodes(ctx, { offlineAfterMs: cfg.OFFLINE_AFTER_MS, heartbeatIntervalMs: cfg.HEARTBEAT_INTERVAL_MS }));
+  every('reconciler', cfg.RECONCILE_INTERVAL_MS, () => reconcile(ctx, heal));
+  every('scrubber', cfg.SCRUB_INTERVAL_MS, () => scrub(ctx, { offlineAfterMs: cfg.OFFLINE_AFTER_MS, batch: cfg.SCRUB_BATCH, maxAgeHours: cfg.SCRUB_MAX_AGE_HOURS }));
+  every('job-runner', cfg.JOB_POLL_MS, () => runner.tick());
   log.info('schedulers running');
 }

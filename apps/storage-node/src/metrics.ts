@@ -8,7 +8,8 @@ const WINDOW_MS = 60_000;
 
 interface Sample {
   at: number;
-  ms: number;
+  /** null: counted for the error rate only (bulk transfers are not a latency signal) */
+  ms: number | null;
   error: boolean;
 }
 
@@ -27,7 +28,7 @@ export class MetricsCollector {
   private samples: Sample[] = [];
   private lastCpu = cpuTimes();
 
-  record(ms: number, error: boolean) {
+  record(ms: number | null, error: boolean) {
     this.samples.push({ at: Date.now(), ms, error });
     if (this.samples.length > 5000) this.samples.splice(0, this.samples.length - 5000);
   }
@@ -63,7 +64,7 @@ export class MetricsCollector {
   snapshot(disk: { usedBytes: number; capacityBytes: number; blobCount: number }, probeMs?: number): NodeMetrics {
     const cutoff = Date.now() - WINDOW_MS;
     this.samples = this.samples.filter((s) => s.at >= cutoff);
-    const times = this.samples.map((s) => s.ms).sort((a, b) => a - b);
+    const times = this.samples.flatMap((s) => (s.ms === null ? [] : [s.ms])).sort((a, b) => a - b);
     const pick = (p: number) => (times.length ? times[Math.min(times.length - 1, Math.floor(p * times.length))]! : 0);
     const errors = this.samples.filter((s) => s.error).length;
     const round = (n: number, d = 2) => Math.round(n * 10 ** d) / 10 ** d;

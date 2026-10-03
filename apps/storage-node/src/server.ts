@@ -36,8 +36,12 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     }
   });
 
+  // Request latency feeds the risk score. Streaming a 50 MB blob takes long because it is big, not
+  // because the node is slow, so only small transfers count as latency samples (all count as errors).
   app.addHook('onResponse', async (req, reply) => {
-    if (req.url.startsWith('/internal/blobs')) metrics.record(reply.elapsedTime, reply.statusCode >= 500);
+    if (!req.url.startsWith('/internal/blobs')) return;
+    const bytes = Number(req.headers['x-expected-size'] ?? req.headers['content-length'] ?? reply.getHeader('content-length') ?? 0);
+    metrics.record(bytes <= 1024 * 1024 ? reply.elapsedTime : null, reply.statusCode >= 500);
   });
 
   app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {

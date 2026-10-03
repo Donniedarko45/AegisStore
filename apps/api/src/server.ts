@@ -15,6 +15,7 @@ import { objectRoutes } from './modules/objects';
 import { analyticsRoutes } from './modules/analytics';
 import { createEventHub, eventRoutes } from './modules/events';
 import { systemRoutes } from './modules/system';
+import { healingRoutes } from './modules/healing';
 import { userRoutes } from './modules/users';
 import { registerAuth } from './plugins/auth';
 
@@ -78,7 +79,7 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
         // if the worker is down)
         await ctx.db.execute(sql`
           SELECT count(*)::int AS healthy FROM storage_nodes
-          WHERE status = 'HEALTHY' AND last_heartbeat_at > now() - make_interval(secs => ${ctx.cfg.OFFLINE_AFTER_MS / 1000})`),
+          WHERE status IN ('HEALTHY', 'WARNING', 'HIGH_RISK') AND last_heartbeat_at > now() - make_interval(secs => ${ctx.cfg.OFFLINE_AFTER_MS / 1000})`),
       );
       const ready = (n?.healthy ?? 0) >= ctx.cfg.REPLICATION_FACTOR;
       return reply.code(ready ? 200 : 503).send({ ready, healthyNodes: n?.healthy ?? 0, required: ctx.cfg.REPLICATION_FACTOR });
@@ -97,6 +98,7 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   analyticsRoutes(app, ctx);
   userRoutes(app, ctx);
   systemRoutes(app, ctx);
+  healingRoutes(app, ctx);
   const hub = createEventHub(ctx.cfg.REDIS_URL, ctx.log);
   app.addHook('onClose', async () => hub.close());
   eventRoutes(app, ctx, hub);

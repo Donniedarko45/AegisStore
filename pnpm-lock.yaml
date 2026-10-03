@@ -156,6 +156,9 @@ importers:
       '@aegis/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@aegis/hashring':
+        specifier: workspace:*
+        version: link:../../packages/hashring
       '@aegis/nodeclient':
         specifier: workspace:*
         version: link:../../packages/nodeclient

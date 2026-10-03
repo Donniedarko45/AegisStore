@@ -232,7 +232,8 @@ check(`served by ${other}`, d.headers.get('x-aegis-served-by') === other, d.head
 r = await alice.get(`/api/buckets/${bucket}/objects?integrity=DEGRADED`);
 check('integrity filter finds the degraded object', r.data.items.some((i) => i.key === `fallback-${run}.txt`));
 r = await alice.get('/api/dashboard/summary');
-check('dashboard shows 2 healthy / 1 at-risk', r.data.nodes.healthy === 2 && r.data.nodes.atRisk === 1, JSON.stringify(r.data.nodes));
+// HEALTHY or WARNING (a node that flapped recently is at risk but still serving)
+check('dashboard shows 1 node offline and 2 serving', r.data.nodes.byStatus.OFFLINE === 1 && r.data.nodes.byStatus.HEALTHY + r.data.nodes.byStatus.WARNING === 2, JSON.stringify(r.data.nodes));
 r = await upload(alice, bucket, `during-outage-${run}.txt`, Buffer.from('written while a node is down'));
 check('uploads still succeed with 2 healthy nodes', r.status === 201 && !r.data.replicas.some((x) => x.node === victim));
 
@@ -276,7 +277,9 @@ if (existsSync(RUNTIME)) {
   check('every download returned correct bytes despite a corrupt replica', allGood);
   check('corrupt replica was detected and marked CORRUPT', flagged);
   const after = (await alice.get(`/api/buckets/${bucket}/object/details?key=${q(ckey)}`)).data;
-  check('integrity now DEGRADED and the bad replica shows a checksum mismatch', after.current.integrity === 'DEGRADED' && !after.replicas.find((y) => y.id === bad.id).checksumMatch);
+  // self-healing may already have rewritten the bad copy; either way it must never look healthy while corrupt
+  const badNow = after.replicas.find((y) => y.id === bad.id);
+  check('bad replica is reported as a mismatch until it is repaired', badNow.state === 'CORRUPT' ? !badNow.checksumMatch && after.current.integrity === 'DEGRADED' : badNow.checksumMatch);
 } else {
   console.log('  - (skipped: RUNTIME_DIR not found)');
 }

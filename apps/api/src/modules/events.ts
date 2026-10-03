@@ -64,7 +64,7 @@ export function eventRoutes(app: FastifyInstance, ctx: AppContext, hub: ReturnTy
     const onEvent = (e: BusEvent) => {
       const bucket = typeof e.data?.bucket === 'string' ? e.data.bucket : null;
       // node health is cluster-wide information; object events only for buckets this user can see
-      const allowed = e.type.startsWith('node.') || isAdmin || (bucket !== null && visible.has(bucket));
+      const allowed = e.type.startsWith('node.') || e.type.startsWith('healing.') || isAdmin || (bucket !== null && visible.has(bucket));
       if (allowed) send(e.type, { ...e.data, at: e.at });
     };
     hub.bus.on('event', onEvent);
