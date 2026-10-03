@@ -68,7 +68,11 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
     try {
       await ctx.db.execute(sql`SELECT 1`);
       const [n] = rowsOf<{ healthy: number }>(
-        await ctx.db.execute(sql`SELECT count(*)::int AS healthy FROM storage_nodes WHERE status = 'HEALTHY'`),
+        // same rule as write placement: HEALTHY *and* heard from recently (status alone may be stale
+        // if the worker is down)
+        await ctx.db.execute(sql`
+          SELECT count(*)::int AS healthy FROM storage_nodes
+          WHERE status = 'HEALTHY' AND last_heartbeat_at > now() - make_interval(secs => ${ctx.cfg.OFFLINE_AFTER_MS / 1000})`),
       );
       const ready = (n?.healthy ?? 0) >= ctx.cfg.REPLICATION_FACTOR;
       return reply.code(ready ? 200 : 503).send({ ready, healthyNodes: n?.healthy ?? 0, required: ctx.cfg.REPLICATION_FACTOR });

@@ -427,12 +427,19 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
 
   // 5. make it visible atomically
   const retention = new Date(Date.now() + ctx.cfg.RETENTION_HOURS * 3_600_000);
-  await ctx.db.transaction(async (tx) => {
+  const finalized = await ctx.db.transaction(async (tx) => {
+    // Only a still-PENDING version may be activated. If the GC already reaped it (an upload that
+    // took longer than the abandoned-upload timeout) we must not point the object at a ghost row.
+    const activated = await tx
+      .update(objectVersions)
+      .set({ state: 'ACTIVE', size: stats.size, sha256: stats.sha256 })
+      .where(and(eq(objectVersions.id, versionId), eq(objectVersions.state, 'PENDING')))
+      .returning({ id: objectVersions.id });
+    if (activated.length === 0) return false;
     await tx
       .update(replicas)
       .set({ state: 'HEALTHY', sha256: stats.sha256, lastVerifiedAt: new Date() })
       .where(and(eq(replicas.versionId, versionId), inArray(replicas.nodeId, nodes.map((n) => n.id))));
-    await tx.update(objectVersions).set({ state: 'ACTIVE', size: stats.size, sha256: stats.sha256 }).where(eq(objectVersions.id, versionId));
     const [locked] = await tx.select().from(objects).where(eq(objects.id, objectId)).for('update');
     if (locked?.currentVersionId && !bucket.versioningEnabled) {
       // overwrite without versioning: the old bytes stay recoverable until the retention purge
@@ -442,7 +449,12 @@ async function uploadObject(ctx: AppContext, req: FastifyRequest<{ Params: { buc
         .where(eq(objectVersions.id, locked.currentVersionId));
     }
     await tx.update(objects).set({ currentVersionId: versionId, updatedAt: new Date() }).where(eq(objects.id, objectId));
+    return true;
   });
+  if (!finalized) {
+    await Promise.allSettled(nodes.map((n) => ctx.storage.deleteBlob(n, blobId)));
+    throw new AppError(502, 'UPLOAD_FAILED', 'Upload took too long and was cleaned up as abandoned; please retry.');
+  }
 
   await audit(ctx, req, {
     action: 'object.upload',

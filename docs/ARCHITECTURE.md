@@ -937,6 +937,8 @@ Batch 1 (Phases 1–5) is implemented. `scripts/verify-e2e.mjs` runs 81 checks a
 | 10 | Separate Dockerfile per service | One `deploy/Dockerfile` with targets `api`, `worker`, `storage-node`, `web`; an optional `extra_ca` build secret for TLS-intercepting proxies | Shared, cached dependency layers. Services run TypeScript through `tsx` (no separate compile step). Bundling with esbuild is a Phase 13 hardening item. |
 | 11 | Grants UI planned for Phase 6 | **Done in Batch 1** (bucket → Settings → Shared access) | Small, and the API already existed. |
 | 12 | Login rate limit fixed | `REGISTER_RATE_LIMIT` / `LOGIN_RATE_LIMIT` env (defaults 10) | Tunable per deployment. |
+| 13 | Upload finalisation | Activates the version only if it is still `PENDING`; otherwise it deletes the blobs and returns `502` | The GC reaps uploads stuck in `PENDING` for more than 1 h. Without this guard, a very slow upload could leave the object pointing at a deleted version. |
+| 14 | `/readyz` counts HEALTHY nodes | Counts nodes that are HEALTHY **and** have sent a heartbeat within `OFFLINE_AFTER_MS` | Matches the write-placement rule, so readiness is not reported from a stale status while the worker is down. |
 
 **Answers to the open questions in §16, as implemented:**
 
