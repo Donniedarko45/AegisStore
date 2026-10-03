@@ -39,7 +39,7 @@ jobs:
         run: |
           cp .env.example .env
           docker compose up -d --build --wait --wait-timeout 300
-      - name: Verify (81 checks incl. node failure, fallback and corruption)
+      - name: Verify (115 checks incl. node failure, fallback, corruption and restore)
         # sudo: the corruption test edits blob files that the containers created as root
         run: sudo -E env "PATH=$PATH" API_URL=http://localhost:8080 node scripts/verify-e2e.mjs
       - name: Logs on failure

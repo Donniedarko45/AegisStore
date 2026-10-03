@@ -921,7 +921,7 @@ Notable codes: `401 UNAUTHENTICATED`, `403 FORBIDDEN`, `404 NOT_FOUND`, `409 CHE
 
 ## 17. As built (Batch 1): deviations and decisions
 
-Batch 1 (Phases 1–5) is implemented. `scripts/verify-e2e.mjs` runs 81 checks against the real `docker compose` stack. Where the code differs from the design above, the code wins and the reason is recorded here.
+Batch 1 (Phases 1–5) is implemented. `scripts/verify-e2e.mjs` runs 115 checks against the real `docker compose` stack. Where the code differs from the design above, the code wins and the reason is recorded here.
 
 | # | Design said | Implemented | Why |
 |---|---|---|---|
