@@ -1,14 +1,15 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { Activity, AlertTriangle, CheckCircle2, Database, Download, FolderPlus, HardDrive, ShieldAlert, Trash2, Upload, UserRound, XCircle } from 'lucide-react';
+import { Activity, AlertTriangle, CheckCircle2, Database, Download, FolderPlus, HardDrive, ShieldAlert, Trash2, Upload, UserRound, Wrench, XCircle } from 'lucide-react';
+import { useHealing } from '../components/app/healing';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { BarList, ChartCard, Legend, SegmentBar, Sparkline, TimeSeries, timeTick, useHidden } from '../components/charts/chart-kit';
 import { Topology } from '../components/figures/topology';
 import { Segmented } from '../components/ui/overlays';
 import { Bytes, Card, CardHeader, EmptyState, Meter, NodeStatus, Num, PageHeader, RelativeTime, Skeleton } from '../components/ui/primitives';
-import { http, type AnalyticsOverview, type Range } from '../lib/api';
+import { http, type AnalyticsOverview, type Range, type SecuritySummary } from '../lib/api';
 import { formatBytes, formatCompact, formatNumber, humanizeAction, plural } from '../lib/format';
-import { useDashboard, useNodes, usePollInterval } from '../lib/queries';
+import { useDashboard, useMe, useNodes, usePollInterval } from '../lib/queries';
 
 export const RANGE_OPTIONS: { value: Range; label: string }[] = [
   { value: '1h', label: '1h' },
@@ -49,6 +50,10 @@ export function OverviewPage() {
   const { hidden, toggle } = useHidden();
   const d = dash.data;
   const a = an.data;
+  const isAdmin = useMe().data?.role === 'ADMIN';
+  const security = useQuery({ queryKey: ['security', 'summary'], queryFn: () => http.get<SecuritySummary>('/api/security/summary'), enabled: isAdmin, refetchInterval: 30_000 });
+  const healing = useHealing();
+  const hq = healing.data?.queue;
   const tick = timeTick(range);
 
   const requests = (a?.totals.uploads ?? 0) + (a?.totals.downloads ?? 0);
@@ -66,6 +71,19 @@ export function OverviewPage() {
         description="Your storage cluster at a glance. Updates live."
         actions={<Segmented label="Time range" value={range} onChange={setRange} options={RANGE_OPTIONS} />}
       />
+      {isAdmin && (security.data?.open ?? 0) > 0 && (
+        <Link
+          to="/security"
+          className="mb-4 flex items-center gap-3 rounded-lg bg-bad-soft px-4 py-3 text-[13px] text-bad-text transition-opacity duration-150 hover:opacity-90"
+        >
+          <ShieldAlert className="size-4 shrink-0" />
+          <span className="min-w-0 flex-1">
+            <span className="font-medium">{plural(security.data!.open, 'open security alert', 'open security alerts')}</span>
+            <span className="opacity-90"> · {formatNumber(security.data!.protectedVersions)} versions protected{security.data!.lockedBuckets.length ? ` · ${plural(security.data!.lockedBuckets.length, 'bucket', 'buckets')} locked` : ''}</span>
+          </span>
+          <span className="shrink-0 font-medium">Review →</span>
+        </Link>
+      )}
 
       {/* KPI row; one hero figure (stored data) leads */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -159,6 +177,14 @@ export function OverviewPage() {
                     { key: 'u', label: 'Unavailable', value: a.integrity.unavailable, color: 'var(--bad)', icon: <XCircle className="size-3.5 text-bad" /> },
                   ]}
                 />
+                {hq && (
+                  <Link to="/nodes" className="mt-4 flex items-center gap-2 rounded-md bg-surface-2 px-3 py-2 text-[13px] text-fg-2 transition-colors duration-150 hover:text-fg">
+                    <Wrench className="size-3.5 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate">
+                      Self-healing: {hq.running + hq.queued > 0 ? `${hq.running + hq.queued} jobs in progress` : 'idle'} · {formatNumber(hq.repaired24h)} copies repaired in 24 h
+                    </span>
+                  </Link>
+                )}
               </>
             ) : (
               <Skeleton className="h-16" />
@@ -173,7 +199,7 @@ export function OverviewPage() {
                     <span className="truncate">{n.name}</span>
                     <span className="text-fg-2 tabular-nums">{formatBytes(n.usedBytes)}</span>
                   </div>
-                  <Meter value={n.usedPct} label={`${n.name} disk usage`} tone={n.status === 'HEALTHY' ? undefined : 'bad'} />
+                  <Meter value={n.usedPct} label={`${n.name} disk usage`} tone={n.status === 'WARNING' ? 'warn' : n.status === 'HIGH_RISK' || n.status === 'OFFLINE' ? 'bad' : undefined} />
                 </li>
               ))}
             </ul>
@@ -181,7 +207,7 @@ export function OverviewPage() {
         </Card>
 
         <Card className="lg:col-span-2">
-          <CardHeader title="Recent activity" action={<Link to="/activity" className="text-[13px] text-fg-2 hover:text-fg">View all</Link>} />
+          <CardHeader title="Recent activity" action={<Link to="/audit" className="text-[13px] text-fg-2 hover:text-fg">View all</Link>} />
           {d && d.recentActivity.length === 0 ? (
             <EmptyState icon={<Activity />} title="No activity yet" description="Create a bucket and upload a file to see it here." />
           ) : (

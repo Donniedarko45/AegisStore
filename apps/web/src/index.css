@@ -262,3 +262,22 @@ kbd,
 @keyframes fade {
   from { opacity: 0; }
 }
+
+/* Items that arrive while the user watches (live timelines): a short fade-up, never a re-run
+   on re-render. @starting-style only applies when the element is first inserted. */
+.enter {
+  transition:
+    opacity 200ms var(--ease-out),
+    transform 200ms var(--ease-out);
+  @starting-style {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .enter {
+    @starting-style {
+      transform: none;
+    }
+  }
+}

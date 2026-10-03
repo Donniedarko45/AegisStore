@@ -1,7 +1,7 @@
 import { Dialog } from '@base-ui/react/dialog';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Command } from 'cmdk';
-import { Activity, BarChart3, Database, HardDrive, KeyRound, LayoutDashboard, LogOut, Monitor, Moon, Plus, Search, Settings, Sun, Users } from 'lucide-react';
+import { Activity, BarChart3, Database, FlaskConical, HardDrive, KeyRound, LayoutDashboard, LogOut, Monitor, Moon, Plus, Search, Settings, ShieldAlert, Sun, Users } from 'lucide-react';
 import { useTheme } from '../../lib/theme';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -71,7 +71,9 @@ export function CommandMenu() {
                 <Item value="buckets" onSelect={() => navigate('/buckets')}><Database /> Buckets</Item>
                 <Item value="storage nodes" onSelect={() => navigate('/nodes')}><HardDrive /> Storage nodes</Item>
                 <Item value="analytics charts" onSelect={() => navigate('/analytics')}><BarChart3 /> Analytics</Item>
-                <Item value="activity audit log" onSelect={() => navigate('/activity')}><Activity /> Activity</Item>
+                <Item value="audit log activity events" onSelect={() => navigate('/audit')}><Activity /> Audit log</Item>
+                {me?.role === 'ADMIN' && <Item value="security ransomware alerts anomaly" onSelect={() => navigate('/security')}><ShieldAlert /> Security</Item>}
+                {me?.role === 'ADMIN' && <Item value="simulation lab chaos faults drill" onSelect={() => navigate('/lab')}><FlaskConical /> Simulation Lab</Item>}
                 {me?.role === 'ADMIN' && <Item value="users administration" onSelect={() => navigate('/users')}><Users /> Users</Item>}
                 <Item value="settings account" onSelect={() => navigate('/settings')}><Settings /> Settings</Item>
                 <Item value="api keys tokens" onSelect={() => navigate('/settings/api-keys')}><KeyRound /> API keys</Item>

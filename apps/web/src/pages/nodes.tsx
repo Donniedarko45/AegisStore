@@ -1,19 +1,24 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Liveline } from 'liveline';
-import { Clock, Cpu, Gauge, HardDrive, MemoryStick, Network, Search } from 'lucide-react';
+import { ArrowDownToLine, Clock, Cpu, Gauge, HardDrive, MemoryStick, Network, Search, Undo2 } from 'lucide-react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { RISK_LABELS, RISK_THRESHOLDS } from '@aegis/shared/web';
+import { HealingPanel } from '../components/app/healing';
+import { RiskBreakdown, RiskGauge } from '../components/figures/risk';
 import { useTheme } from '../lib/theme';
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { ChartCard, entityColor, Sparkline, TimeSeries, timeTick } from '../components/charts/chart-kit';
+import { ChartCard, entityColor, Legend, Sparkline, TimeSeries, timeTick, useHidden } from '../components/charts/chart-kit';
 import { HashRingFigure, walkRing } from '../components/figures/hash-ring';
 import { UptimeBars } from '../components/figures/uptime';
 import { Button } from '../components/ui/button';
-import { Segmented, Sheet } from '../components/ui/overlays';
-import { Card, CardHeader, ErrorNote, Input, Meter, NodeStatus, PageHeader, RelativeTime, Skeleton } from '../components/ui/primitives';
-import { http, type NodeDetail, type NodeDto, type NodeMetricsSeries, type RingData, type UptimeData } from '../lib/api';
+import { ConfirmDialog, Segmented, Sheet } from '../components/ui/overlays';
+import { Badge, Card, CardHeader, ErrorNote, Input, Meter, NodeStatus, PageHeader, RelativeTime, Skeleton } from '../components/ui/primitives';
+import { http, type NodeDetail, type NodeDto, type NodeMetricsSeries, type Range, type RingData, type RiskSeries, type UptimeData } from '../lib/api';
 import { useLive, type LivePoint } from '../lib/live';
 import { cx, formatBytes, formatDuration, plural } from '../lib/format';
-import { useNodes } from '../lib/queries';
+import { useMe, useNodes } from '../lib/queries';
 import { useCssColors } from '../lib/use-css-color';
 
 const SERIES_VARS = ['--series-1', '--series-2', '--series-3', '--series-4'] as const;
@@ -56,6 +61,7 @@ function NodeCard({ n, names, spark, onOpen }: { n: NodeDto; names: string[]; sp
           </div>
           <NodeStatus status={n.status} />
         </div>
+        <RiskLine n={n} />
         <div className="mt-4">
           <div className="mb-1.5 flex justify-between text-xs text-fg-2 tabular-nums">
             <span>{formatBytes(n.usedBytes)} used</span>
@@ -79,6 +85,27 @@ function NodeCard({ n, names, spark, onOpen }: { n: NodeDto; names: string[]; sp
         </p>
       </Card>
     </button>
+  );
+}
+
+/** Score, its band and the main reason, in one line (the full breakdown is in the node sheet). */
+function RiskLine({ n }: { n: NodeDto }) {
+  const score = n.riskScore;
+  const band = score >= RISK_THRESHOLDS.highRisk ? 'bad' : score >= RISK_THRESHOLDS.warning ? 'warn' : 'good';
+  const top = n.risk?.top;
+  return (
+    <div className="mt-4 flex items-center gap-3 text-xs">
+      <span className="text-fg-2">Failure risk</span>
+      <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-surface-2" role="img" aria-label={`Risk ${(score * 100).toFixed(0)} of 100`}>
+        <div
+          className={cx('absolute inset-y-0 left-0 w-full origin-left rounded-full', band === 'bad' ? 'bg-bad' : band === 'warn' ? 'bg-warn' : 'bg-good')}
+          style={{ transform: `scaleX(${Math.max(0.02, Math.min(1, score))})`, transition: 'transform 300ms var(--ease-out)' }}
+        />
+      </div>
+      <span className="w-6 text-right font-medium tabular-nums">{(score * 100).toFixed(0)}</span>
+      {top && score >= 0.1 ? <span className="max-w-28 truncate text-fg-3">{RISK_LABELS[top]}</span> : <span className="text-fg-3">no signals</span>}
+      {n.draining && <Badge tone="info">Draining</Badge>}
+    </div>
   );
 }
 
@@ -138,6 +165,42 @@ function LiveLatency({ names, seeded }: { names: string[]; seeded: ReturnType<ty
   );
 }
 
+function RiskHistory({ names }: { names: string[] }) {
+  const [range, setRange] = useState<Range>('1h');
+  const { hidden, toggle } = useHidden();
+  const q = useQuery({ queryKey: ['node-risk', range], queryFn: () => http.get<RiskSeries>(`/api/nodes/risk?range=${range}`), placeholderData: keepPreviousData, refetchInterval: 30_000 });
+  const sorted = [...names].sort();
+  const series = sorted.map((n) => ({ key: n, label: n, color: entityColor(n, sorted) }));
+  const tick = timeTick(range);
+  const rows = q.data?.series ?? [];
+  return (
+    <ChartCard
+      title="Failure risk over time"
+      description="0 to 100, sampled every 30 seconds. Dashed lines mark the warning (40) and high-risk (70) thresholds."
+      fetching={q.isFetching && q.isPlaceholderData}
+      legend={<Legend series={series} hidden={hidden} onToggle={toggle} />}
+      action={<Segmented size="sm" label="Risk range" value={range} onChange={setRange} options={[{ value: '1h', label: '1h' }, { value: '6h', label: '6h' }, { value: '24h', label: '24h' }]} />}
+      table={{ columns: ['Time', ...sorted], rows: rows.map((r) => [tick(r.t), ...sorted.map((n) => (typeof r[n] === 'number' ? Math.round((r[n] as number) * 100) : '—'))]) }}
+    >
+      {rows.length < 2 ? (
+        <p className="px-5 py-16 text-center text-[13px] text-fg-3">History appears after a minute of samples.</p>
+      ) : (
+        <TimeSeries
+          kind="line"
+          data={rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === 'number' ? Math.round(v * 1000) / 10 : v]))) as typeof rows}
+          series={series}
+          hidden={hidden}
+          format={(v) => v.toFixed(0)}
+          labelFormat={tick}
+          yDomain={[0, 100]}
+          references={[{ y: RISK_THRESHOLDS.warning * 100, label: 'warning' }, { y: RISK_THRESHOLDS.highRisk * 100, label: 'high risk' }]}
+          height={220}
+        />
+      )}
+    </ChartCard>
+  );
+}
+
 function RingExplorer({ ring }: { ring: RingData }) {
   const [key, setKey] = useState('research-data/reports/q3.pdf');
   const [submitted, setSubmitted] = useState(key);
@@ -194,6 +257,19 @@ function RingExplorer({ ring }: { ring: RingData }) {
 function NodeSheet({ id, onClose }: { id: string | null; onClose: () => void }) {
   const q = useQuery({ queryKey: ['node', id], queryFn: () => http.get<NodeDetail>(`/api/nodes/${id}`), enabled: !!id, refetchInterval: 15_000 });
   const n = q.data?.node;
+  const isAdmin = useMe().data?.role === 'ADMIN';
+  const qc = useQueryClient();
+  const [confirmDrain, setConfirmDrain] = useState(false);
+  const drain = useMutation({
+    mutationFn: (on: boolean) => http.post<{ status: string }>(`/api/nodes/${id}/${on ? 'drain' : 'undrain'}`),
+    onSuccess: (_r, on) => {
+      setConfirmDrain(false);
+      void qc.invalidateQueries({ queryKey: ['nodes'] });
+      void qc.invalidateQueries({ queryKey: ['node', id] });
+      toast.success(on ? `Draining ${n?.name}` : `${n?.name} accepts writes again`, { description: on ? 'No new writes. Self-healing is moving every replica to other nodes.' : undefined });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Failed'),
+  });
   const hist = (q.data?.history ?? []).map((h) => ({ t: h.ts, p50: h.latencyMsP50, p95: h.latencyMsP95, cpu: h.cpuPct, mem: h.memPct, disk: h.diskUsedPct, probe: h.probeMs }));
   const tick = timeTick('1h');
   return (
@@ -210,6 +286,44 @@ function NodeSheet({ id, onClose }: { id: string | null; onClose: () => void }) 
               <span className="text-fg-2">Last heartbeat <RelativeTime iso={n.lastHeartbeatAt} /></span>
               {n.metrics && <span className="text-fg-2">· up {formatDuration(n.metrics.uptimeSec)}</span>}
             </div>
+            <Card className="p-4">
+              <div className="flex flex-wrap items-center gap-5">
+                <RiskGauge score={n.riskScore} />
+                <div className="min-w-0 flex-1 text-[13px]">
+                  <p className="font-medium">Predicted failure risk</p>
+                  <p className="mt-0.5 text-fg-2">
+                    {n.riskScore >= RISK_THRESHOLDS.highRisk
+                      ? 'High risk: no new writes go here and self-healing is copying its data to safer nodes.'
+                      : n.riskScore >= RISK_THRESHOLDS.warning
+                        ? 'Warning: still serving, watched closely. Writes continue.'
+                        : 'Healthy: no signal points to an upcoming failure.'}
+                  </p>
+                  {n.risk?.updatedAt && <p className="mt-1 text-xs text-fg-3">Scored <RelativeTime iso={n.risk.updatedAt} /> from live metrics and recent history.</p>}
+                </div>
+              </div>
+              {n.risk && (
+                <div className="mt-4 border-t border-line pt-4">
+                  <RiskBreakdown risk={n.risk} />
+                </div>
+              )}
+            </Card>
+            {isAdmin && (
+              <div className="flex items-center justify-between gap-4 rounded-lg p-4 shadow-[inset_0_0_0_1px_var(--border)]">
+                <div className="text-[13px]">
+                  <p className="font-medium">{n.draining ? 'Node is draining' : 'Drain node'}</p>
+                  <p className="text-fg-2">{n.draining ? 'Its replicas are being moved away. Stop to accept writes again.' : 'Stop new writes and move every replica to other nodes, e.g. before maintenance.'}</p>
+                </div>
+                {n.draining ? (
+                  <Button loading={drain.isPending} onClick={() => drain.mutate(false)}>
+                    <Undo2 /> Stop draining
+                  </Button>
+                ) : (
+                  <Button onClick={() => setConfirmDrain(true)} disabled={n.status === 'OFFLINE'}>
+                    <ArrowDownToLine /> Drain
+                  </Button>
+                )}
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-3">
               {[
                 ['Replicas held', q.data!.replicaCount.toLocaleString()],
@@ -241,6 +355,16 @@ function NodeSheet({ id, onClose }: { id: string | null; onClose: () => void }) 
           </>
         ) : null}
       </div>
+      <ConfirmDialog
+        open={confirmDrain}
+        onOpenChange={setConfirmDrain}
+        tone="primary"
+        title={`Drain ${n?.name ?? 'node'}?`}
+        description="New writes will skip this node and self-healing will copy each of its replicas to another node before removing it here. Reads keep working throughout."
+        confirmLabel="Start draining"
+        onConfirm={() => drain.mutate(true)}
+        busy={drain.isPending}
+      />
     </Sheet>
   );
 }
@@ -255,6 +379,7 @@ export function NodesPage() {
   const [uptimeRange, setUptimeRange] = useState<'1h' | '24h' | '7d'>('24h');
   const uptime = useQuery({ queryKey: ['uptime', uptimeRange], queryFn: () => http.get<UptimeData>(`/api/nodes/uptime?range=${uptimeRange}`), placeholderData: keepPreviousData, refetchInterval: 30_000 });
   const healthy = items.filter((n) => n.status === 'HEALTHY').length;
+  const atRisk = items.filter((n) => n.status === 'WARNING' || n.status === 'HIGH_RISK').length;
   const openId = params.get('node');
 
   useEffect(() => {
@@ -265,7 +390,7 @@ export function NodesPage() {
     <>
       <PageHeader
         title="Storage nodes"
-        description={items.length ? `${healthy} of ${plural(items.length, 'node', 'nodes')} healthy. Nodes heartbeat every 5 seconds and go offline after 15 seconds of silence.` : 'Nodes register themselves with their first heartbeat.'}
+        description={items.length ? `${healthy} of ${plural(items.length, 'node', 'nodes')} healthy${atRisk ? `, ${atRisk} at risk` : ''}. Every node is scored for failure risk every 10 seconds; data on risky or offline nodes is re-replicated automatically.` : 'Nodes register themselves with their first heartbeat.'}
       />
       {nodes.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-80 rounded-xl" />)}</div>
@@ -277,8 +402,13 @@ export function NodesPage() {
         </div>
       )}
 
-      <div className="mt-4">
+      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
         <LiveLatency names={names} seeded={seeded} />
+        <RiskHistory names={names} />
+      </div>
+
+      <div className="mt-4">
+        <HealingPanel />
       </div>
 
       <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">

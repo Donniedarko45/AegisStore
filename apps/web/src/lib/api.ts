@@ -57,11 +57,75 @@ export interface UploadResult {
   versionNo: number;
   size: number;
   sha256: string;
-  replicas: { node: string; path: string }[];
+  replicas: { node: string; path: string; fallbackFor?: string }[];
+  parts?: number;
+}
+
+/** Files above this size go through multipart upload (parallel, resumable parts). */
+export const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
+
+function putWithProgress(url: string, body: Blob, contentType: string, onProgress: (loaded: number) => void, signal?: AbortSignal): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('content-type', contentType);
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onload = () => {
+      const data = safeJson(xhr.responseText);
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+      const e = data?.error;
+      reject(new ApiError(xhr.status, e?.code ?? 'ERROR', e?.message ?? `Upload failed (${xhr.status})`, e?.requestId));
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'NETWORK', 'Network error while uploading'));
+    xhr.onabort = () => reject(new ApiError(0, 'ABORTED', 'Upload cancelled'));
+    if (signal?.aborted) return xhr.abort();
+    signal?.addEventListener('abort', () => xhr.abort());
+    xhr.send(body);
+  });
+}
+
+/**
+ * Multipart upload: parts go up three at a time, each retried up to 3 times (a dropped
+ * connection costs one part, not the whole file), then the server assembles and verifies them.
+ */
+export async function uploadMultipart(bucket: string, key: string, file: File, onProgress: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<UploadResult> {
+  const base = `/api/buckets/${q(bucket)}/multipart`;
+  const init = await http.post<{ uploadId: string; partSize: number }>(`${base}?key=${q(key)}`, { size: file.size, contentType: file.type || 'application/octet-stream' });
+  const partSize = init.partSize;
+  const count = Math.max(1, Math.ceil(file.size / partSize));
+  const loaded = new Array<number>(count).fill(0);
+  const report = () => onProgress(loaded.reduce((a, b) => a + b, 0), file.size);
+  const parts: { partNo: number; sha256: string }[] = [];
+  let next = 0;
+  try {
+    await Promise.all(
+      Array.from({ length: Math.min(3, count) }, async () => {
+        while (next < count) {
+          const i = next++;
+          const blob = file.slice(i * partSize, Math.min(file.size, (i + 1) * partSize));
+          for (let attempt = 1; ; attempt++) {
+            try {
+              const r = (await putWithProgress(`${base}/${init.uploadId}/parts/${i + 1}`, blob, 'application/octet-stream', (l) => ((loaded[i] = l), report()), signal)) as { sha256: string };
+              parts[i] = { partNo: i + 1, sha256: r.sha256 };
+              break;
+            } catch (e) {
+              if (signal?.aborted || attempt >= 3 || (e instanceof ApiError && e.status >= 400 && e.status < 500)) throw e;
+              loaded[i] = 0;
+              await new Promise((r) => setTimeout(r, 500 * attempt));
+            }
+          }
+        }
+      }),
+    );
+    return await http.post<UploadResult>(`${base}/${init.uploadId}/complete`, { parts });
+  } catch (e) {
+    void http.del(`${base}/${init.uploadId}`).catch(() => undefined);
+    throw e;
+  }
 }
 
 /** Upload with progress + cancellation (fetch cannot report upload progress, XHR can). */
-export function uploadObject(bucket: string, key: string, file: File, onProgress: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<UploadResult> {
+export function uploadSingle(bucket: string, key: string, file: File, onProgress: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', objectUrl(bucket, key));
@@ -78,6 +142,11 @@ export function uploadObject(bucket: string, key: string, file: File, onProgress
     signal?.addEventListener('abort', () => xhr.abort());
     xhr.send(file);
   });
+}
+
+/** Upload a file: one streamed request, or multipart above MULTIPART_THRESHOLD. */
+export function uploadObject(bucket: string, key: string, file: File, onProgress: (loaded: number, total: number) => void, signal?: AbortSignal): Promise<UploadResult> {
+  return file.size > MULTIPART_THRESHOLD ? uploadMultipart(bucket, key, file, onProgress, signal) : uploadSingle(bucket, key, file, onProgress, signal);
 }
 
 // ------------------------------------------------------------------------------------- types
@@ -100,6 +169,8 @@ export interface VersionDto {
   isDeleteMarker: boolean;
   isCurrent: boolean;
   isProtected: boolean;
+  protectedUntil: string | null;
+  entropy: number | null;
   createdAt: string;
   deletedAt: string | null;
   purgeAfter: string | null;
@@ -110,6 +181,7 @@ export interface ObjectDetails {
   key: string;
   bucket: string;
   placement: { key: string; ringPos: number; ringOrder: string[] } | null;
+  access: { reads24h: number; reads7d: number; lastAccessedAt: string | null; classChangedAt: string | null; hourly: { t: string; reads: number }[] };
   current: {
     versionId: string;
     versionNo: number;
@@ -161,6 +233,8 @@ export interface AnalyticsOverview {
   integrity: { healthy: number; degraded: number; unavailable: number };
   sizeHistogram: { bucket: string; objects: number }[];
   topDownloads: { bucket: string; key: string; downloads: number; bytes: number }[];
+  byClass: { class: 'HOT' | 'WARM' | 'COLD'; objects: number; bytes: number; reads24h: number; replicas: number }[];
+  classChanges: { t: string; promoted: number; demoted: number }[];
 }
 export interface RingData {
   vnodesPerNode: number;
@@ -191,6 +265,12 @@ export interface UptimeData {
     bars: { t: string; upPct: number | null }[];
     incidents: { start: string; end: string | null; durationSec: number }[];
   }[];
+}
+export interface RiskSeries {
+  range: Range;
+  step: string;
+  nodes: string[];
+  series: MetricRow[];
 }
 export interface NodeDetail {
   node: NodeDto;
@@ -255,4 +335,138 @@ export interface SystemInfo {
   startedAt: string;
   components: { api: string; database: string; postgresVersion: string | null; redis: 'up' | 'down' };
   config: { replicationFactor: number; vnodesPerNode: number; offlineAfterMs: number; probationBeats: number; maxUploadBytes: number; verifyBufferMaxBytes: number; retentionHours: number };
+}
+
+// ------------------------------------------------------------------------- self-healing
+export interface HealingSummary {
+  reconciler: {
+    at: string;
+    scanned: number;
+    underReplicated: number;
+    overReplicated: number;
+    cannotReachTarget: number;
+    noSource: number;
+    waitingGrace: number;
+    enqueued: number;
+    updatedAt: string | null;
+  } | null;
+  queue: { queued: number; running: number; done24h: number; failed24h: number; repaired24h: number; trimmed24h: number; verified24h: number; bytesHealed24h: number };
+  scrub: { replicas: number; verified7d: number; oldestVerification: string | null };
+  integrity: { corrupt: number; missing: number };
+}
+export type JobType = 'REPAIR_REPLICA' | 'TRIM_REPLICA' | 'VERIFY_REPLICA';
+export type JobStatus = 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELLED';
+export interface HealingJob {
+  id: string;
+  type: JobType;
+  status: JobStatus;
+  priority: number;
+  reason: string | null;
+  bucket: string | null;
+  key: string | null;
+  node: string | null;
+  result: Record<string, unknown> | null;
+  attempts: number;
+  lastError: string | null;
+  bytes: number;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+export interface HealingActivity {
+  range: Range;
+  step: string;
+  series: { t: string; repaired: number; trimmed: number; verified: number; failed: number; bytes: number }[];
+}
+
+// ----------------------------------------------------------------------------- security
+export type Severity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+export type EventStatus = 'OPEN' | 'ACKNOWLEDGED' | 'RESOLVED' | 'FALSE_POSITIVE';
+export interface SecuritySignal {
+  signal: 'DELETE_BURST' | 'OVERWRITE_BURST' | 'ENTROPY_SHIFT' | 'EXTENSION_CHURN' | 'RATE_ANOMALY';
+  value: number;
+  threshold: number;
+  severity: Severity;
+  detail: string;
+}
+export interface SecurityEvent {
+  id: string;
+  kind: 'RANSOMWARE' | 'MASS_DELETE' | 'ANOMALY';
+  severity: Severity;
+  status: EventStatus;
+  bucket: string | null;
+  actor: string | null;
+  actorId: string | null;
+  actorType: string | null;
+  signals: SecuritySignal[];
+  counts: Record<string, number>;
+  attackStart: string;
+  lastSeenAt: string;
+  protectedVersions: number;
+  contained: boolean;
+  notes: string | null;
+  recovery: { restored: number; removed: number; unchanged: number; unrecoverable: number; failed: string[]; at: string; by: string } | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface SecuritySummary {
+  open: number;
+  bySeverity: Record<Severity, number>;
+  lockedBuckets: string[];
+  protectedVersions: number;
+  daily: { day: string; severity: Severity; n: number }[];
+}
+export interface SecurityEventDetail {
+  event: SecurityEvent;
+  timeline: { t: string; uploads: number; deletes: number; suspicious: number }[];
+  actions: { action: string; key: string; at: string; entropy: number | null; prev: number | null }[];
+}
+export interface RecoveryPlan {
+  bucket: string;
+  attackStart: string;
+  summary: { restore: number; remove: number; unchanged: number; unrecoverable: number };
+  items: { key: string; action: 'restore' | 'remove' | 'unchanged' | 'unrecoverable'; currentVersionNo: number | null; cleanVersionNo: number | null; currentEntropy: number | null; cleanEntropy: number | null; size: number | null }[];
+}
+
+// ----------------------------------------------------------------------------- sharing
+export interface ShareLink {
+  id: string;
+  createdBy: string | null;
+  versionNo: number | null;
+  createdAt: string;
+  expiresAt: string;
+  maxDownloads: number | null;
+  downloads: number;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  status: 'ACTIVE' | 'EXPIRED' | 'REVOKED' | 'USED_UP';
+}
+
+// ------------------------------------------------------------------------ simulation lab
+export interface ChaosState {
+  offline: boolean;
+  latencyMs: number;
+  errorRate: number;
+  diskFillPct: number;
+}
+export type RunKind = 'CHAOS' | 'CORRUPT' | 'TRAFFIC' | 'RANSOMWARE';
+export interface SimRun {
+  id: string;
+  kind: RunKind;
+  status: 'RUNNING' | 'DONE' | 'FAILED';
+  params: Record<string, unknown>;
+  scope: { nodes?: string[]; buckets?: string[] };
+  summary: Record<string, unknown> | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+export interface SimulationState {
+  nodes: { id: string; name: string; status: string; riskScore: number; reachable: boolean; chaos: ChaosState | null }[];
+  runs: SimRun[];
+}
+export interface SimRunDetail {
+  run: SimRun;
+  counts: { uploads: number; downloads: number; deletes: number };
+  timeline: { action: string; actor: string | null; metadata: Record<string, unknown>; at: string }[];
 }

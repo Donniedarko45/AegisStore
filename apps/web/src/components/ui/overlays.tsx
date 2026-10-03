@@ -1,3 +1,4 @@
+import { Slider } from '@base-ui/react/slider';
 import { Dialog } from '@base-ui/react/dialog';
 import { Drawer } from '@base-ui/react/drawer';
 import { Menu } from '@base-ui/react/menu';
@@ -94,11 +95,13 @@ export function ConfirmDialog({
   busy,
   error,
   tone = 'danger',
+  children,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
   title: ReactNode;
   description: ReactNode;
+  children?: ReactNode;
   confirmLabel?: string;
   confirmText?: string;
   onConfirm: () => void;
@@ -141,6 +144,7 @@ export function ConfirmDialog({
           />
         </label>
       ) : null}
+      {children}
       {error}
     </Modal>
   );
@@ -406,5 +410,60 @@ export function HoldButton({ children, onConfirm, disabled, holdMs = 1500 }: { c
         {children}
       </span>
     </button>
+  );
+}
+
+// ------------------------------------------------------------------------------------ Slider
+/**
+ * Labelled slider (base-ui). `onCommit` fires once when the user lets go (or per keyboard step),
+ * so expensive side effects do not run on every pixel of a drag. No motion: it tracks the pointer.
+ */
+export function SliderField({
+  label,
+  value,
+  onChange,
+  onCommit,
+  min = 0,
+  max = 100,
+  step = 1,
+  format = (v: number) => String(v),
+  disabled,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  onCommit?: (v: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  format?: (v: number) => string;
+  disabled?: boolean;
+}) {
+  const one = (v: number | readonly number[]) => (Array.isArray(v) ? (v[0] as number) : (v as number));
+  return (
+    <Slider.Root
+      value={value}
+      min={min}
+      max={max}
+      step={step}
+      disabled={disabled}
+      onValueChange={(v) => onChange(one(v))}
+      onValueCommitted={(v) => onCommit?.(one(v))}
+      className={cx('block', disabled && 'opacity-60')}
+    >
+      <div className="mb-2 flex items-baseline justify-between gap-3 text-[13px]">
+        <Slider.Label className="text-fg-2">{label}</Slider.Label>
+        <span className="font-medium tabular-nums">{format(value)}</span>
+      </div>
+      <Slider.Control className="flex h-5 w-full touch-none items-center select-none">
+        <Slider.Track className="relative h-1.5 w-full rounded-full bg-surface-3">
+          <Slider.Indicator className="rounded-full bg-fg" />
+          <Slider.Thumb
+            aria-label={label}
+            className="size-4 rounded-full bg-surface shadow-[0_0_0_1px_var(--border-2),0_1px_3px_rgb(0_0_0/0.2)] outline-none focus-visible:shadow-[0_0_0_1px_var(--fg-3),0_0_0_4px_var(--focus)]"
+          />
+        </Slider.Track>
+      </Slider.Control>
+    </Slider.Root>
   );
 }

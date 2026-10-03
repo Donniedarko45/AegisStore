@@ -8,6 +8,7 @@ import {
   CartesianGrid,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -206,6 +207,7 @@ export function TimeSeries({
   syncId,
   stacked,
   yDomain,
+  references = [],
 }: {
   data: Row[];
   series: Series[];
@@ -218,8 +220,20 @@ export function TimeSeries({
   syncId?: string;
   stacked?: boolean;
   yDomain?: [number | string, number | string];
+  /** horizontal thresholds (dashed hairline + label), e.g. risk levels */
+  references?: { y: number; label: string }[];
 }) {
   const visible = series.filter((s) => !hidden.has(s.key));
+  const refs = references.map((r) => (
+    <ReferenceLine
+      key={r.label}
+      y={r.y}
+      stroke="var(--axis)"
+      strokeDasharray="4 4"
+      ifOverflow="extendDomain"
+      label={{ value: r.label, position: 'insideTopLeft', fill: 'var(--fg-3)', fontSize: 11 }}
+    />
+  ));
   const tickEvery = Math.max(1, Math.ceil(data.length / 6));
   const xTicks = useMemo(() => data.filter((_, i) => i % tickEvery === 0).map((d) => d.t), [data, tickEvery]);
   const common = { data, margin: { top: 8, right: 12, bottom: 0, left: 4 }, syncId } as const;
@@ -254,6 +268,7 @@ export function TimeSeries({
             {xAxis}
             {yAxis}
             {tooltip}
+            {refs}
             {visible.map((s, i) => (
               <Bar
                 key={s.key}
@@ -275,6 +290,7 @@ export function TimeSeries({
             {xAxis}
             {yAxis}
             {tooltip}
+            {refs}
             {visible.map((s) => (
               <Line key={s.key} dataKey={s.key} stroke={s.color} strokeWidth={2} dot={false} activeDot={{ ...activeDot, fill: s.color }} type="monotone" isAnimationActive={false} connectNulls />
             ))}
@@ -293,6 +309,7 @@ export function TimeSeries({
             {xAxis}
             {yAxis}
             {tooltip}
+            {refs}
             {visible.map((s) => (
               <Area
                 key={s.key}

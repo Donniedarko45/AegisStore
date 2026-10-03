@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowDown, ArrowUp, ChevronRight, Database, Download, File as FileIcon, FolderOpen, FolderUp, Globe, History, Lock, RotateCcw, Search, Trash2, Upload, UserPlus, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronRight, Database, Download, File as FileIcon, Flame, FolderOpen, FolderUp, Globe, History, Lock, RotateCcw, Search, ShieldAlert, Snowflake, ThermometerSun, Trash2, Upload, UserPlus, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -62,6 +62,7 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
   const [q, setQ] = useState('');
   const [dq, setDq] = useState('');
   const [integrity, setIntegrity] = useState<'all' | 'HEALTHY' | 'DEGRADED' | 'UNAVAILABLE'>('all');
+  const [klass, setKlass] = useState<'all' | 'HOT' | 'WARM' | 'COLD'>('all');
   const [sort, setSort] = useState<Sort>('key');
   const [order, setOrder] = useState<'asc' | 'desc'>('asc');
   const [page, setPage] = useState(1);
@@ -77,11 +78,11 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
     }, 200);
     return () => clearTimeout(t);
   }, [q]);
-  useEffect(() => setPage(1), [prefix, integrity, sort, order]);
+  useEffect(() => setPage(1), [prefix, integrity, klass, sort, order]);
 
   const searching = dq.length > 0;
   const list = useQuery({
-    queryKey: ['objects', bucket.name, { prefix, dq, integrity, sort, order, page }],
+    queryKey: ['objects', bucket.name, { prefix, dq, integrity, klass, sort, order, page }],
     queryFn: () => {
       const p = new URLSearchParams({ sort, order, page: String(page), pageSize: '50' });
       if (searching) p.set('q', dq);
@@ -90,6 +91,7 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
         if (prefix) p.set('prefix', prefix);
       }
       if (integrity !== 'all') p.set('integrity', integrity);
+      if (klass !== 'all') p.set('class', klass);
       return http.get<ObjectList>(`/api/buckets/${encodeURIComponent(bucket.name)}/objects?${p}`);
     },
     placeholderData: keepPreviousData,
@@ -175,6 +177,18 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
             { value: 'UNAVAILABLE', label: 'Unavailable' },
           ]}
         />
+        <SelectBox
+          label="Filter by access class"
+          value={klass}
+          onChange={setKlass}
+          className="w-36"
+          options={[
+            { value: 'all', label: 'All classes' },
+            { value: 'HOT', label: 'Hot' },
+            { value: 'WARM', label: 'Warm' },
+            { value: 'COLD', label: 'Cold' },
+          ]}
+        />
       </div>
 
       <Card className="overflow-hidden">
@@ -185,18 +199,19 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
         ) : empty ? (
           <EmptyState
             icon={searching ? <Search /> : <FolderOpen />}
-            title={searching ? `Nothing matches “${dq}”` : integrity !== 'all' ? `No ${integrityLabel(integrity).toLowerCase()} objects here` : prefix ? 'This folder is empty' : 'This bucket is empty'}
+            title={searching ? `Nothing matches “${dq}”` : klass !== 'all' ? `No ${klass.toLowerCase()} objects here` : integrity !== 'all' ? `No ${integrityLabel(integrity).toLowerCase()} objects here` : prefix ? 'This folder is empty' : 'This bucket is empty'}
             description={canWrite && !searching ? 'Drop files anywhere on this page, or use Upload.' : undefined}
             action={canWrite && !searching && <Button variant="primary" onClick={() => fileInput.current?.click()}><Upload /> Upload files</Button>}
           />
         ) : (
           <div className={cx('relative overflow-x-auto transition-opacity duration-200 ease-[ease]', list.isFetching && list.isPlaceholderData && 'opacity-60')}>
-            <table className="w-full min-w-[720px]">
+            <table className="w-full min-w-[800px]">
               <thead className="border-b border-line">
                 <tr>
                   <SortHead k="key">Name</SortHead>
                   <SortHead k="size" align="right">Size</SortHead>
                   <Th>Integrity</Th>
+                  <Th>Class</Th>
                   <Th>Replicas</Th>
                   <SortHead k="createdAt">Modified</SortHead>
                   <Th align="right"><span className="sr-only">Actions</span></Th>
@@ -213,6 +228,7 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
                         </span>
                       </Td>
                       <Td align="right" className="text-fg-2 tabular-nums">{formatBytes(p.bytes)}</Td>
+                      <Td className="text-fg-3">—</Td>
                       <Td className="text-fg-3">—</Td>
                       <Td className="text-fg-2">{plural(p.objects, 'object', 'objects')}</Td>
                       <Td className="text-fg-3">—</Td>
@@ -232,9 +248,16 @@ function ObjectsTab({ bucket, canWrite }: { bucket: BucketDto; canWrite: boolean
                       <Td align="right" className="whitespace-nowrap tabular-nums">{formatBytes(o.size)}</Td>
                       <Td><Badge tone={integrityTone(o.integrity)} icon>{integrityLabel(o.integrity)}</Badge></Td>
                       <Td>
+                        <span className="inline-flex items-center gap-1.5 text-[13px] text-fg-2">
+                          {o.storageClass === 'HOT' ? <Flame className="size-3.5" /> : o.storageClass === 'COLD' ? <Snowflake className="size-3.5" /> : <ThermometerSun className="size-3.5" />}
+                          {o.storageClass.charAt(0) + o.storageClass.slice(1).toLowerCase()}
+                        </span>
+                      </Td>
+                      <Td>
                         <span className="flex items-center gap-1" aria-label={`${o.availableReplicas} of ${o.targetReplicas} replicas available`}>
                           {Array.from({ length: o.targetReplicas }, (_, i) => (
-                            <span key={i} className={cx('h-3 w-1.5 rounded-sm', i < o.availableReplicas ? 'bg-good' : 'bg-bad')} />
+                            // a HOT object's extra copy still being made is not a fault: neutral, not red
+                            <span key={i} className={cx('h-3 w-1.5 rounded-sm', i < o.availableReplicas ? 'bg-good' : o.integrity === 'HEALTHY' ? 'bg-surface-3' : 'bg-bad')} />
                           ))}
                           <span className="ml-1 text-xs text-fg-2 tabular-nums">{o.availableReplicas}/{o.targetReplicas}</span>
                         </span>
@@ -421,11 +444,13 @@ function SettingsTab({ bucket, isOwner }: { bucket: BucketDto; isOwner: boolean 
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
   const patch = useMutation({
-    mutationFn: (b: { versioningEnabled?: boolean }) => http.patch(`/api/buckets/${encodeURIComponent(bucket.name)}`, b),
+    mutationFn: (b: { versioningEnabled?: boolean; protectedMode?: boolean; autoLock?: boolean }) => http.patch(`/api/buckets/${encodeURIComponent(bucket.name)}`, b),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['bucket', bucket.name] });
+      void qc.invalidateQueries({ queryKey: ['security'] });
       toast.success('Saved');
     },
+    onError: (e) => toast.error(e instanceof Error ? e.message : 'Could not save'),
   });
   const del = useMutation({
     mutationFn: () => http.del(`/api/buckets/${encodeURIComponent(bucket.name)}`),
@@ -445,6 +470,25 @@ function SettingsTab({ bucket, isOwner }: { bucket: BucketDto; isOwner: boolean 
           label="Versioning"
           description="Keep every version when objects are overwritten. Deleting creates a marker instead of removing data."
         />
+      </Card>
+      <Card>
+        <CardHeader title="Ransomware protection" description="Every write and delete is watched for mass deletion, encrypted overwrites and ransomware file names. On a high-severity alert, every pre-attack version is protected for 30 days." />
+        <div className="space-y-5 border-t border-line px-5 py-4">
+          <SwitchField
+            checked={bucket.autoLock}
+            onChange={(v) => patch.mutate({ autoLock: v })}
+            disabled={patch.isPending}
+            label="Lock automatically on attack"
+            description="Also lock the bucket the moment an attack is detected, so the attacker cannot delete or overwrite anything else. Turning this off needs a signed-in session."
+          />
+          <SwitchField
+            checked={bucket.protectedMode}
+            onChange={(v) => patch.mutate({ protectedMode: v })}
+            disabled={patch.isPending}
+            label="Locked"
+            description={bucket.protectedMode ? 'Deletes and overwrites are refused (new objects can still be added). Unlocking needs a signed-in session, and an administrator while an alert is open.' : 'Lock now to freeze existing data, e.g. while you investigate.'}
+          />
+        </div>
       </Card>
       <Card className="shadow-[0_0_0_1px_var(--bad-soft)]">
         <CardHeader title="Delete bucket" description="Permanently delete this bucket. It must contain no objects. This cannot be undone." />
@@ -504,10 +548,20 @@ export function BucketPage() {
             <span className="tabular-nums">{plural(bucket.objectCount ?? 0, 'object', 'objects')} · {formatBytes(bucket.totalBytes)}</span>
             {bucket.publicRead ? <Badge tone="warn"><Globe className="size-3" /> Public read</Badge> : <Badge><Lock className="size-3" /> Private</Badge>}
             {bucket.versioningEnabled && <Badge tone="info"><History className="size-3" /> Versioned</Badge>}
+            {bucket.protectedMode && <Badge tone="bad"><ShieldAlert className="size-3" /> Locked</Badge>}
             {!canWrite && <Badge>Read only</Badge>}
           </span>
         }
       />
+      {bucket.protectedMode && (
+        <div className="mb-5 flex items-start gap-3 rounded-lg bg-bad-soft p-3.5 text-[13px] text-bad-text">
+          <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+          <div>
+            <p className="font-medium">This bucket is locked</p>
+            <p className="opacity-90">Deleting or overwriting objects is refused with “423 Locked”, usually after suspicious activity. New uploads and downloads still work.{canAdmin && ' Unlock it in Settings once the incident is resolved.'}</p>
+          </div>
+        </div>
+      )}
       <TabsBar
         className="mb-5"
         value={tab}

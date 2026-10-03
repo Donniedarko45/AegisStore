@@ -14,6 +14,8 @@ const BucketPage = named(() => import('./pages/bucket'), 'BucketPage');
 const NodesPage = named(() => import('./pages/nodes'), 'NodesPage');
 const ActivityPage = named(() => import('./pages/activity'), 'ActivityPage');
 const UsersPage = named(() => import('./pages/users'), 'UsersPage');
+const SecurityPage = named(() => import('./pages/security'), 'SecurityPage');
+const LabPage = named(() => import('./pages/lab'), 'LabPage');
 const SettingsPage = named(() => import('./pages/settings'), 'SettingsPage');
 const NotFound = named(() => import('./pages/not-found'), 'NotFound');
 const AuthPage = lazy(() => import('./pages/auth').then((m) => ({ default: m.AuthPage })));
@@ -34,6 +36,12 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
       </div>
     );
   if (!me) return <Navigate to="/login" state={{ from: loc.pathname + loc.search }} replace />;
+  return <>{children}</>;
+}
+
+function AdminOnly({ children }: { children: React.ReactNode }) {
+  const { data: me } = useMe();
+  if (me && me.role !== 'ADMIN') return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -58,7 +66,10 @@ export function App() {
           <Route path="buckets" element={<BucketsPage />} />
           <Route path="buckets/:bucket" element={<BucketPage />} />
           <Route path="nodes" element={<NodesPage />} />
-          <Route path="activity" element={<ActivityPage />} />
+          <Route path="audit" element={<ActivityPage />} />
+          <Route path="activity" element={<Navigate to="/audit" replace />} />
+          <Route path="security" element={<AdminOnly><SecurityPage /></AdminOnly>} />
+          <Route path="lab" element={<AdminOnly><LabPage /></AdminOnly>} />
           <Route path="users" element={<UsersPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="settings/:section" element={<SettingsPage />} />

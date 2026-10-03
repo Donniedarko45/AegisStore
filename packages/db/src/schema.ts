@@ -335,7 +335,7 @@ export const simulationRuns = pgTable(
     status: text('status').notNull().default('RUNNING'),
     params: jsonb('params').$type<Record<string, unknown>>().notNull().default({}),
     /** which nodes / buckets the run touches: the timeline is the audit trail within this scope */
-    scope: jsonb('scope').$type<{ nodes?: string[]; buckets?: string[] }>().notNull().default({}),
+    scope: jsonb('scope').$type<{ nodes?: string[]; buckets?: string[]; keys?: string[] }>().notNull().default({}),
     summary: jsonb('summary').$type<Record<string, unknown>>(),
     createdBy: uuid('created_by').references(() => users.id),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),

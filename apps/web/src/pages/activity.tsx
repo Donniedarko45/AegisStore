@@ -1,10 +1,10 @@
 import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
-import { Activity, ChevronRight, Download, FolderPlus, HardDrive, KeyRound, Search, ShieldAlert, ShieldCheck, Trash2, Upload, UserRound } from 'lucide-react';
+import { Activity, ChevronRight, Download, FileDown, FlaskConical, FolderPlus, HardDrive, KeyRound, Link2, Search, ShieldAlert, ShieldCheck, Trash2, Upload, UserRound, Wrench } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import { toast } from 'sonner';
-import { Button } from '../components/ui/button';
-import { SelectBox } from '../components/ui/overlays';
+import { Button, buttonStyles } from '../components/ui/button';
+import { Segmented, SelectBox } from '../components/ui/overlays';
 import { Badge, Card, EmptyState, ErrorNote, Input, Mono, PageHeader, RelativeTime, Skeleton, type Tone } from '../components/ui/primitives';
 import { Spinner } from '../components/ui/spinner';
 import { http, type AuditItem } from '../lib/api';
@@ -20,12 +20,26 @@ const GROUPS = [
   { value: 'apikey.', label: 'API keys' },
   { value: 'node.', label: 'Storage nodes' },
   { value: 'user.', label: 'Users' },
+  { value: 'replica.', label: 'Self-healing' },
+  { value: 'security.', label: 'Security alerts' },
+  { value: 'share.', label: 'Share links' },
+  { value: 'simulation.', label: 'Simulation Lab' },
   { value: 'retention.', label: 'Retention' },
 ];
+const ACTORS = [
+  { value: 'all', label: 'Any actor' },
+  { value: 'USER', label: 'People (session)' },
+  { value: 'API_KEY', label: 'API keys' },
+  { value: 'SIGNED_URL', label: 'Share links' },
+  { value: 'SYSTEM', label: 'System' },
+  { value: 'ANONYMOUS', label: 'Anonymous' },
+];
+type Period = '1h' | '24h' | '7d' | '30d' | 'all';
+const PERIOD_MS: Record<Period, number> = { '1h': 3_600_000, '24h': 86_400_000, '7d': 7 * 86_400_000, '30d': 30 * 86_400_000, all: 0 };
 
 const iconFor = (a: string) =>
-  a.includes('upload') ? Upload : a.includes('download') ? Download : a.includes('delete') || a.includes('purge') ? Trash2 : a.startsWith('node') ? HardDrive : a.includes('integrity') || a.includes('mismatch') || a.includes('failed') ? ShieldAlert : a.startsWith('auth') || a.startsWith('user') ? UserRound : a.startsWith('bucket') ? FolderPlus : a.startsWith('apikey') ? KeyRound : Activity;
-const toneFor = (a: string): Tone => (a.includes('fail') || a.includes('mismatch') || a.includes('offline') || a.includes('corrupt') ? 'bad' : a.includes('delete') || a.includes('purge') || a.includes('revoke') ? 'warn' : a.includes('online') || a.includes('register') || a.includes('restore') ? 'good' : 'neutral');
+  a.startsWith('replica.') ? Wrench : a.startsWith('security.') ? ShieldAlert : a.startsWith('share.') ? Link2 : a.startsWith('simulation.') ? FlaskConical : a.includes('upload') ? Upload : a.includes('download') ? Download : a.includes('delete') || a.includes('purge') ? Trash2 : a.startsWith('node') ? HardDrive : a.includes('integrity') || a.includes('mismatch') || a.includes('failed') ? ShieldAlert : a.startsWith('auth') || a.startsWith('user') ? UserRound : a.startsWith('bucket') ? FolderPlus : a.startsWith('apikey') ? KeyRound : Activity;
+const toneFor = (a: string): Tone => (a.includes('fail') || a.includes('mismatch') || a.includes('offline') || a.includes('corrupt') || a.includes('alert') || a.includes('high_risk') ? 'bad' : a.includes('delete') || a.includes('purge') || a.includes('revoke') ? 'warn' : a.includes('online') || a.includes('register') || a.includes('restore') ? 'good' : 'neutral');
 
 /** JSON with keys de-emphasised so values read first. Rendered as text nodes (never innerHTML). */
 function JsonView({ value }: { value: unknown }) {
@@ -95,6 +109,8 @@ function Row({ ev, open, onToggle }: { ev: AuditItem; open: boolean; onToggle: (
 export function ActivityPage() {
   const me = useMe().data;
   const [group, setGroup] = useState('all');
+  const [actorType, setActorType] = useState('all');
+  const [period, setPeriod] = useState<Period>('all');
   const [q, setQ] = useState('');
   const [dq, setDq] = useState('');
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -103,13 +119,22 @@ export function ActivityPage() {
     return () => clearTimeout(t);
   }, [q]);
 
+  /** the same filter drives the list and the CSV export */
+  const filterParams = () => {
+    const p = new URLSearchParams();
+    if (group !== 'all') p.set('action', group);
+    if (actorType !== 'all') p.set('actorType', actorType);
+    if (period !== 'all') p.set('from', new Date(Date.now() - PERIOD_MS[period]).toISOString());
+    if (dq) p.set('q', dq);
+    return p;
+  };
   const feed = useInfiniteQuery({
-    queryKey: ['audit', group, dq],
+    queryKey: ['audit', group, dq, actorType, period],
     initialPageParam: 1,
     queryFn: ({ pageParam }) => {
-      const p = new URLSearchParams({ page: String(pageParam), pageSize: '50' });
-      if (group !== 'all') p.set('action', group);
-      if (dq) p.set('q', dq);
+      const p = filterParams();
+      p.set('page', String(pageParam));
+      p.set('pageSize', '50');
       return http.get<{ items: AuditItem[]; total: number; page: number; pageSize: number }>(`/api/audit?${p}`);
     },
     getNextPageParam: (last) => (last.page * last.pageSize < last.total ? last.page + 1 : undefined),
@@ -127,9 +152,16 @@ export function ActivityPage() {
   return (
     <>
       <PageHeader
-        title="Activity"
+        title="Audit log"
         description={me?.role === 'ADMIN' ? 'Every security-relevant event in the cluster. Entries are hash-chained: any edit or deletion is detectable.' : 'A tamper-evident record of your own actions.'}
-        actions={me?.role === 'ADMIN' && <Button onClick={() => verify.mutate()} loading={verify.isPending}><ShieldCheck /> Verify integrity</Button>}
+        actions={
+          <>
+            <a href={`/api/audit/export?${filterParams()}`} download className={buttonStyles()}>
+              <FileDown /> Export CSV
+            </a>
+            {me?.role === 'ADMIN' && <Button onClick={() => verify.mutate()} loading={verify.isPending}><ShieldCheck /> Verify integrity</Button>}
+          </>
+        }
       />
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <div className="relative min-w-60 flex-1">
@@ -137,6 +169,8 @@ export function ActivityPage() {
           <Input aria-label="Search activity" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by actor, action or detail…" className="pl-8" />
         </div>
         <SelectBox label="Event type" value={group} onChange={setGroup} options={GROUPS} className="w-44" />
+        <SelectBox label="Actor" value={actorType} onChange={setActorType} options={ACTORS} className="w-40" />
+        <Segmented size="sm" label="Period" value={period} onChange={setPeriod} options={[{ value: '1h', label: '1h' }, { value: '24h', label: '24h' }, { value: '7d', label: '7d' }, { value: '30d', label: '30d' }, { value: 'all', label: 'All' }]} />
         <span className="text-[13px] text-fg-2 tabular-nums">{total.toLocaleString()} events</span>
       </div>
       <Card className="overflow-hidden">

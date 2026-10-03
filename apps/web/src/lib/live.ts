@@ -1,5 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
+import { toast } from 'sonner';
 import { create } from 'zustand';
 
 export interface LivePoint {
@@ -90,7 +91,53 @@ export function LiveConnection({ enabled }: { enabled: boolean }) {
     es.addEventListener('object.created', onObject);
     es.addEventListener('object.deleted', onObject);
     es.addEventListener('bucket.created', onObject);
-    es.addEventListener('replica.flagged', () => void qc.invalidateQueries({ queryKey: ['object'] }));
+    es.addEventListener('replica.flagged', () => {
+      void qc.invalidateQueries({ queryKey: ['object'] });
+      void qc.invalidateQueries({ queryKey: ['healing'] });
+    });
+    // risk scores move every 10 s per node: refresh the fleet at most every 3 s
+    let riskTimer: ReturnType<typeof setTimeout> | null = null;
+    es.addEventListener('node.risk', () => {
+      riskTimer ??= setTimeout(() => {
+        riskTimer = null;
+        void qc.invalidateQueries({ queryKey: ['nodes'] });
+      }, 3000);
+    });
+    // self-healing: jobs start and finish in bursts; coalesce them the same way
+    let healTimer: ReturnType<typeof setTimeout> | null = null;
+    const onHeal = (e: Event) => {
+      const d = parse(e as MessageEvent) as { bucket?: string };
+      healTimer ??= setTimeout(() => {
+        healTimer = null;
+        void qc.invalidateQueries({ queryKey: ['healing'] });
+        void qc.invalidateQueries({ queryKey: ['object'] });
+        if (d.bucket) void qc.invalidateQueries({ queryKey: ['objects', d.bucket] });
+      }, 1000);
+    };
+    for (const t of ['job.updated', 'replica.repaired', 'replica.trimmed', 'healing.planned']) es.addEventListener(t, onHeal);
+    es.addEventListener('object.class_changed', onObject);
+    es.addEventListener('simulation.updated', () => void qc.invalidateQueries({ queryKey: ['simulation'] }));
+    es.addEventListener('security.updated', () => void qc.invalidateQueries({ queryKey: ['security'] }));
+    // an attack is the one event worth interrupting someone for (only admins receive these)
+    es.addEventListener('security.alert', (e) => {
+      const d = parse(e as MessageEvent) as { bucket?: string; severity?: string; kind?: string; protectedVersions?: number; bucketLocked?: boolean; eventId?: string };
+      void qc.invalidateQueries({ queryKey: ['security'] });
+      void qc.invalidateQueries({ queryKey: ['buckets'] });
+      const what = d.kind === 'RANSOMWARE' ? 'Possible ransomware' : d.kind === 'MASS_DELETE' ? 'Mass deletion' : 'Unusual activity';
+      toast.error(`${what} in ${d.bucket ?? 'a bucket'} (${(d.severity ?? '').toLowerCase()})`, {
+        id: `sec-${d.eventId}`,
+        description: `${d.protectedVersions ?? 0} pre-attack versions protected${d.bucketLocked ? ', bucket locked' : ''}.`,
+        action: {
+          label: 'Review',
+          onClick: () => {
+            // client-side navigation without a reload (react-router listens to popstate)
+            window.history.pushState({}, '', `/security?event=${d.eventId ?? ''}`);
+            window.dispatchEvent(new PopStateEvent('popstate'));
+          },
+        },
+        duration: 15_000,
+      });
+    });
     return () => {
       es.close();
       setStatus('offline');

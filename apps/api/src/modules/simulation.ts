@@ -46,7 +46,7 @@ const MILESTONES = [
 export function simulationRoutes(app: FastifyInstance, ctx: AppContext) {
   const ref = (n: typeof storageNodes.$inferSelect) => ({ id: n.id, name: n.name, baseUrl: n.baseUrl });
 
-  async function startRun(kind: string, userId: string, params: Record<string, unknown>, scope: { nodes?: string[]; buckets?: string[] }, status = 'RUNNING') {
+  async function startRun(kind: string, userId: string, params: Record<string, unknown>, scope: { nodes?: string[]; buckets?: string[]; keys?: string[] }, status = 'RUNNING') {
     const [run] = await ctx.db
       .insert(simulationRuns)
       .values({ kind, status, params, scope, createdBy: userId, ...(status !== 'RUNNING' && { finishedAt: new Date() }) })
@@ -128,7 +128,8 @@ export function simulationRoutes(app: FastifyInstance, ctx: AppContext) {
     if (!target) throw AppError.notFound('No healthy replica matches; upload something first');
     const [n] = await ctx.db.select().from(storageNodes).where(eq(storageNodes.id, target.node_id));
     await ctx.storage.corruptBlob(ref(n!), target.blob_id);
-    const run = await startRun('CORRUPT', p.user.id, { bucket: target.bucket, key: target.key, node: n!.name }, { nodes: [n!.name], buckets: [target.bucket] }, 'DONE');
+    // scoped to the one object: the node may be busy with unrelated healing at the same time
+    const run = await startRun('CORRUPT', p.user.id, { bucket: target.bucket, key: target.key, node: n!.name }, { buckets: [target.bucket], keys: [target.key] }, 'DONE');
     await ctx.db.execute(sql`
       INSERT INTO jobs (type, dedupe_key, priority, payload, reason, max_attempts)
       VALUES ('VERIFY_REPLICA', ${`verify:${target.replica_id}`}, 5, ${JSON.stringify({ replicaId: target.replica_id, bucket: target.bucket, key: target.key, node: n!.name })}::jsonb, 'simulation: bit rot injected', 3)
@@ -231,10 +232,12 @@ export function simulationRoutes(app: FastifyInstance, ctx: AppContext) {
     if (!run) throw AppError.notFound('Run not found');
     const nodes = run.scope.nodes ?? [];
     const bucketNames = run.scope.buckets ?? [];
+    const keys = run.scope.keys ?? [];
     const inScope = sql`(
       (resource_type = 'node' AND metadata->>'name' = ANY(${textArray(nodes)}))
       OR metadata->>'node' = ANY(${textArray(nodes)}) OR metadata->>'to' = ANY(${textArray(nodes)}) OR metadata->>'from' = ANY(${textArray(nodes)})
-      OR metadata->>'bucket' = ANY(${textArray(bucketNames)}))`;
+      OR metadata->>'bucket' = ANY(${textArray(bucketNames)}))
+      AND (${keys.length === 0} OR action LIKE 'simulation.%' OR metadata->>'key' = ANY(${textArray(keys)}))`;
     const until = run.finishedAt && run.kind === 'CHAOS' ? sql`${run.finishedAt}::timestamptz + interval '2 minutes'` : sql`now()`;
     const events = rowsOf<{ action: string; actor_label: string | null; metadata: Record<string, unknown>; created_at: Date }>(
       await ctx.db.execute(sql`

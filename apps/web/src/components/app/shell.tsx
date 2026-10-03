@@ -21,7 +21,9 @@ const NAV = [
   { to: '/buckets', label: 'Buckets' },
   { to: '/nodes', label: 'Nodes' },
   { to: '/analytics', label: 'Analytics' },
-  { to: '/activity', label: 'Activity' },
+  { to: '/security', label: 'Security', admin: true },
+  { to: '/lab', label: 'Lab', admin: true },
+  { to: '/audit', label: 'Audit log' },
   { to: '/users', label: 'Users', admin: true },
   { to: '/settings', label: 'Settings' },
 ];
@@ -93,7 +95,7 @@ function ClusterStatus() {
   const nodes = useNodes().data?.items ?? [];
   const down = nodes.filter((n) => n.status !== 'HEALTHY').length;
   const tone = !nodes.length ? 'neutral' : down === 0 ? 'good' : down === nodes.length ? 'bad' : 'warn';
-  const label = !nodes.length ? 'No nodes' : down === 0 ? 'All systems normal' : `${plural(down, 'node', 'nodes')} need attention`;
+  const label = !nodes.length ? 'No nodes' : down === 0 ? 'All systems normal' : down === 1 ? '1 node needs attention' : `${plural(down, 'node', 'nodes')} need attention`;
   const liveText = live === 'live' ? 'Live updates connected' : live === 'connecting' ? 'Connecting to live updates…' : 'Live updates offline: polling';
   return (
     <Tip content={liveText}>

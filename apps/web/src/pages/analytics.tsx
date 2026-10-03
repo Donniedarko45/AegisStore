@@ -1,10 +1,11 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { BarList, ChartCard, entityColor, Legend, TimeSeries, timeTick, useHidden, type Series } from '../components/charts/chart-kit';
+import { BarList, ChartCard, entityColor, Legend, SegmentBar, TimeSeries, timeTick, useHidden, type Series } from '../components/charts/chart-kit';
+import { Flame, Snowflake, ThermometerSun } from 'lucide-react';
 import { Segmented } from '../components/ui/overlays';
 import { Card, CardHeader, Num, PageHeader, Skeleton } from '../components/ui/primitives';
-import { http, type NodeMetricsSeries, type Range } from '../lib/api';
+import { http, type HealingActivity, type NodeMetricsSeries, type Range } from '../lib/api';
 import { formatBytes, formatCompact, formatNumber } from '../lib/format';
 import { RANGE_OPTIONS, useAnalytics } from './overview';
 
@@ -23,6 +24,23 @@ function Totals({ items }: { items: { label: string; value: React.ReactNode }[] 
   );
 }
 
+const CLASS_LABEL = { HOT: 'Hot', WARM: 'Warm', COLD: 'Cold' } as const;
+// class is an identity (not a status): categorical slots, plus an icon and a label on every use
+const CLASS_COLOR = { COLD: 'var(--series-1)', HOT: 'var(--series-2)', WARM: 'var(--series-3)' } as const;
+function ClassIcon({ c }: { c: 'HOT' | 'WARM' | 'COLD' }) {
+  const Icon = c === 'HOT' ? Flame : c === 'COLD' ? Snowflake : ThermometerSun;
+  return <Icon className="size-3.5" style={{ color: CLASS_COLOR[c] }} />;
+}
+const HEAL_SERIES: Series[] = [
+  { key: 'repaired', label: 'Repaired', color: 'var(--series-1)' },
+  { key: 'trimmed', label: 'Trimmed', color: 'var(--series-2)' },
+  { key: 'verified', label: 'Verified', color: 'var(--series-3)' },
+];
+const CHANGE_SERIES: Series[] = [
+  { key: 'promoted', label: 'Promoted to HOT', color: 'var(--series-2)' },
+  { key: 'demoted', label: 'Demoted', color: 'var(--series-1)' },
+];
+
 export function AnalyticsPage() {
   const [range, setRange] = useState<Range>('24h');
   const navigate = useNavigate();
@@ -36,6 +54,7 @@ export function AnalyticsPage() {
     refetchInterval: 30_000,
   });
   const m = metrics.data;
+  const heal = useQuery({ queryKey: ['healing', 'activity', range], queryFn: () => http.get<HealingActivity>(`/api/healing/activity?range=${range}`), placeholderData: keepPreviousData, refetchInterval: 30_000 });
   const mTick = timeTick(METRIC_RANGE[range]);
   const nodeSeries: Series[] = (m?.nodes ?? []).map((n) => ({ key: n, label: n, color: entityColor(n, m?.nodes ?? []) }));
 
@@ -138,6 +157,63 @@ export function AnalyticsPage() {
         </Card>
       </div>
 
+      <h2 className="mt-10 mb-1 text-base font-semibold tracking-tight">Access classes and replication</h2>
+      <p className="mb-4 text-[13px] text-fg-2">Objects read often become HOT and get an extra replica; self-healing repairs, trims and re-verifies copies continuously.</p>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <Card>
+          <CardHeader title="Access classes" description="Current versions by how often they are read" />
+          <div className="px-5 pb-5">
+            {a ? (
+              <>
+                <SegmentBar
+                  parts={a.byClass.map((c) => ({ key: c.class, label: CLASS_LABEL[c.class], value: c.objects, color: CLASS_COLOR[c.class], icon: <ClassIcon c={c.class} /> }))}
+                />
+                <table className="mt-4 w-full text-[13px]">
+                  <thead>
+                    <tr className="text-left text-xs text-fg-2">
+                      <th className="pb-1.5 font-normal">Class</th>
+                      <th className="pb-1.5 text-right font-normal">Stored</th>
+                      <th className="pb-1.5 text-right font-normal">Reads 24 h</th>
+                      <th className="pb-1.5 text-right font-normal">Copies</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-line">
+                    {a.byClass.map((c) => (
+                      <tr key={c.class}>
+                        <td className="py-1.5">{CLASS_LABEL[c.class]}</td>
+                        <td className="py-1.5 text-right tabular-nums">{formatBytes(c.bytes)}</td>
+                        <td className="py-1.5 text-right tabular-nums">{formatCompact(c.reads24h)}</td>
+                        <td className="py-1.5 text-right tabular-nums">{formatNumber(c.replicas)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            ) : (
+              <Skeleton className="h-32" />
+            )}
+          </div>
+        </Card>
+        <ChartCard
+          title="Replication activity"
+          description="Self-healing jobs finished per interval"
+          value={heal.data ? <span>{formatBytes(heal.data.series.reduce((x, r) => x + r.bytes, 0))} copied</span> : undefined}
+          fetching={heal.isFetching && heal.isPlaceholderData}
+          legend={<Legend series={HEAL_SERIES} mark="rect" />}
+          table={heal.data ? { columns: ['Time', 'Repaired', 'Trimmed', 'Verified', 'Failed'], rows: heal.data.series.map((r) => [tick(r.t), r.repaired, r.trimmed, r.verified, r.failed]) } : undefined}
+        >
+          {heal.data ? <TimeSeries kind="bar" stacked data={heal.data.series} series={HEAL_SERIES} format={(v) => formatNumber(v)} labelFormat={tick} height={200} /> : <Skeleton className="m-3 h-48" />}
+        </ChartCard>
+        <ChartCard
+          title="Class changes"
+          description="Promotions to HOT and demotions"
+          legend={<Legend series={CHANGE_SERIES} mark="rect" />}
+          table={a ? { columns: ['Time', 'Promoted', 'Demoted'], rows: a.classChanges.map((r) => [tick(r.t), r.promoted, r.demoted]) } : undefined}
+        >
+          {a ? <TimeSeries kind="bar" data={a.classChanges} series={CHANGE_SERIES} format={(v) => formatNumber(v)} labelFormat={tick} height={200} /> : <Skeleton className="m-3 h-48" />}
+        </ChartCard>
+      </div>
+
       <h2 className="mt-10 mb-1 text-base font-semibold tracking-tight">Node performance</h2>
       <p className="mb-4 text-[13px] text-fg-2">Sampled every 30 seconds{range === '7d' || range === '30d' ? ' · showing the last 24h (metric retention is shorter)' : ''}. Hover any chart to compare all nodes at that moment.</p>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -148,7 +224,7 @@ export function AnalyticsPage() {
           legend={<Legend series={nodeSeries} hidden={probe.hidden} onToggle={probe.toggle} />}
           table={m ? nodeTable(m.probe, (v) => `${v} ms`) : undefined}
         >
-          {m ? <TimeSeries kind="line" data={m.probe} series={nodeSeries} hidden={probe.hidden} format={(v) => `${v.toFixed(2)} ms`} labelFormat={mTick} syncId="nodes" /> : <Skeleton className="m-3 h-52" />}
+          {m ? <TimeSeries kind="line" data={m.probe} series={nodeSeries} hidden={probe.hidden} format={(v) => `${v.toFixed(2)} ms`} axisFormat={(v) => `${Math.round(v)} ms`} labelFormat={mTick} syncId="nodes" /> : <Skeleton className="m-3 h-52" />}
         </ChartCard>
         <ChartCard
           title="Request latency p95"
@@ -157,7 +233,7 @@ export function AnalyticsPage() {
           legend={<Legend series={nodeSeries} hidden={lat.hidden} onToggle={lat.toggle} />}
           table={m ? nodeTable(m.latencyP95, (v) => `${v} ms`) : undefined}
         >
-          {m ? <TimeSeries kind="line" data={m.latencyP95} series={nodeSeries} hidden={lat.hidden} format={(v) => `${v.toFixed(1)} ms`} labelFormat={mTick} syncId="nodes" /> : <Skeleton className="m-3 h-52" />}
+          {m ? <TimeSeries kind="line" data={m.latencyP95} series={nodeSeries} hidden={lat.hidden} format={(v) => `${v.toFixed(1)} ms`} axisFormat={(v) => `${Math.round(v)} ms`} labelFormat={mTick} syncId="nodes" /> : <Skeleton className="m-3 h-52" />}
         </ChartCard>
         <ChartCard
           title="CPU"
