@@ -16,6 +16,12 @@ Browser ──> nginx :8080 (React dashboard + /api proxy)
 
 The full design, from requirements and data model to failure handling and the roadmap, is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Demo
+
+[![Watch the AegisStore demo (1:40)](docs/media/aegisstore-showcase-poster.png)](docs/media/aegisstore-showcase.mp4)
+
+A 1:40 walkthrough recorded on the running system: upload and placement on the hash ring, a crashed node detected and healed, a corrupt replica repaired, a failing node flagged by its risk score, and a ransomware drill recovered in one click. Click the image to watch or download the video ([`docs/media/aegisstore-showcase.mp4`](docs/media/aegisstore-showcase.mp4)).
+
 ## Quick start
 
 Requirements: Docker with Compose v2.
